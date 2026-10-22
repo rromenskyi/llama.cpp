@@ -372,3 +372,17 @@ def test_rename_error_counts_as_success(monkeypatch, mode, ok):
     else:
         assert res.status_code == 500
         assert os.listdir(store_path(FP)) == []
+
+
+def test_short_file_keeps_previous_slot(monkeypatch):
+    # the tail of the file is lost, like a buffered write that failed at close: the old slot file stays
+    global server
+    write_file(store_path(FP, "k1.slot"), data=b"previous")
+    monkeypatch.setenv("LLAMA_SERVER_TEST_SAVE_TRUNCATE", "1")
+    server.start()
+    fill_slot(1)
+    res = save(1, "k1.slot")
+    assert res.status_code == 500
+    assert "bytes" in res.body["error"]["message"]
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    assert open(store_path(FP, "k1.slot"), "rb").read() == b"previous"

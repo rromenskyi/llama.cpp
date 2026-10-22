@@ -2686,7 +2686,7 @@ private:
             ckpt_write_buf(ofs, cur.data_dft,  n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
         }
-        ofs.flush();
+        ofs.close();
         if (!ofs) {
             SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
             return false;
@@ -2784,7 +2784,7 @@ private:
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write_buf(ofs, data_dft,  n_written);
         ckpt_write_buf(ofs, data_spec, n_written);
-        ofs.flush();
+        ofs.close();
         if (!ofs) {
             SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
             return false;
@@ -3071,7 +3071,7 @@ private:
                     }
 
                     std::string err_commit;
-                    if (use_tmp && !slot_store_commit(filepath_write, filepath, err_commit)) {
+                    if (use_tmp && !slot_store_commit(filepath_write, filepath, nwrite + nwrite_ckpt + nwrite_dft, err_commit)) {
                         SLT_WRN(*slot, "unable to save slot to '%s': %s\n", filepath.c_str(), err_commit.c_str());
                         send_error(task, "Unable to save slot: " + err_commit, ERROR_TYPE_SERVER);
                         break;

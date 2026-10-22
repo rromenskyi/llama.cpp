@@ -1232,7 +1232,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 With `--slot-store DIR --slot-fingerprint FP`, slots are saved to and restored from `DIR/FP/`, and `DIR` can be shared by many servers (for example a soft-mounted NFS volume). Both flags are needed, and they cannot be used with `--slot-save-path`. `DIR` and `DIR/FP` are created at start with mode 0770 when missing; the parent of `DIR` must exist.
 
-- The save `filename` must be `<key>.slot`, where the key (and the fingerprint) is 1 to 128 characters of `[A-Za-z0-9_-]`. A save writes `DIR/FP/.<key>.<random>.tmp`, calls fsync and renames it to `<key>.slot`, so readers never see a partial file. If the rename reports an error but `<key>.slot` exists and the temporary file is gone (a retried rename over NFS), the save succeeded.
+- The save `filename` must be `<key>.slot`, where the key (and the fingerprint) is 1 to 128 characters of `[A-Za-z0-9_-]`. A save writes `DIR/FP/.<key>.<random>.tmp`, calls fsync, checks that its size matches the bytes written, and renames it to `<key>.slot`, so readers never see a partial file. A failed save leaves the previous `<key>.slot` in place. If the rename reports an error but `<key>.slot` exists and the temporary file is gone (a retried rename over NFS), the save succeeded.
 - Every minute, `*.tmp` files older than one hour under `DIR/*/` are removed.
 - The endpoints below need the API key like `/slots`. They are answered on the HTTP threads with file system calls, never by the inference loop. Every slot store request except `GET /slot-store/drained` counts as router contact for the drain, see **Graceful drain**.
 

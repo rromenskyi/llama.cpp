@@ -62,12 +62,14 @@ static const std::string & slot_store_boot_id() {
     return id;
 }
 
-bool slot_store_commit(const std::string & tmp, const std::string & path, std::string & err) {
+bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err) {
     // test hook: "before" fails the rename, "after" renames and then reports an error
     static const std::string test_rename_error = [] {
         const char * val = getenv("LLAMA_SERVER_TEST_RENAME_ERROR");
         return std::string(val ? val : "");
     }();
+    // test hook: drops the last byte of tmp, like a buffered tail write that failed at close
+    static const bool test_truncate = getenv("LLAMA_SERVER_TEST_SAVE_TRUNCATE") != nullptr;
 
     auto fail = [&](const std::string & msg) {
         std::error_code ec;
@@ -75,6 +77,11 @@ bool slot_store_commit(const std::string & tmp, const std::string & path, std::s
         err = msg;
         return false;
     };
+
+    if (test_truncate && n_bytes > 0) {
+        std::error_code ec;
+        fs::resize_file(fs::u8path(tmp), n_bytes - 1, ec);
+    }
 
 #ifndef _WIN32
     const int fd = open(tmp.c_str(), O_WRONLY | O_CLOEXEC);
@@ -93,7 +100,16 @@ bool slot_store_commit(const std::string & tmp, const std::string & path, std::s
     }
 #endif
 
+    // the writers do not check every close, a tail lost there shows up as a short file
     std::error_code ec;
+    const uintmax_t size = fs::file_size(fs::u8path(tmp), ec);
+    if (ec) {
+        return fail("stat: " + ec.message());
+    }
+    if (size != n_bytes) {
+        return fail(string_format("the file has %ju bytes, %" PRIu64 " were written", size, n_bytes));
+    }
+
     if (test_rename_error != "before") {
         fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
     }

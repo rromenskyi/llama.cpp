@@ -21,8 +21,8 @@ bool slot_store_valid_filename(const std::string & filename);
 // a unique temporary file next to path: .<key>.<random>.tmp
 std::string slot_store_tmp_path(const std::string & path);
 
-// fsync tmp and rename it to path; on failure tmp is removed
-bool slot_store_commit(const std::string & tmp, const std::string & path, std::string & err);
+// fsync tmp, check that it holds n_bytes, and rename it to path; on failure tmp is removed
+bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err);
 
 struct server_slot_store {
     // creates <dir>/<fingerprint>/ and starts the janitor, throws on error

@@ -324,19 +324,24 @@ struct fetcher {
     }
 
     // the lock is held by whoever creates lock/owner, O_EXCL makes that exclusive also on NFS
-    bool take_lock() {
-        mkdir(lock.c_str(), 0777);
+    // returns 0 when taken, EEXIST when another process holds it, otherwise the errno of the failure
+    int take_lock() {
+        const int err_dir = mkdir(lock.c_str(), 0777) == 0 ? 0 : errno;
         int fd = open((lock + "/owner").c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
         if (fd < 0) {
-            return false;
+            // without the lock directory, the reason it could not be made says more
+            return errno == ENOENT && err_dir != 0 && err_dir != EEXIST ? err_dir : errno;
         }
         const std::string line = token + "\n";
+        errno = 0;
         const bool ok = write_all(fd, line.data(), line.size());
-        if (close(fd) != 0 || !ok) {
+        const int err_write = ok ? 0 : (errno ? errno : EIO);
+        const int err_close = close(fd) == 0 ? 0 : errno;
+        if (err_write != 0 || err_close != 0) {
             unlink((lock + "/owner").c_str());
-            return false;
+            return err_write != 0 ? err_write : err_close;
         }
-        return true;
+        return 0;
     }
 
     bool holds_lock() {
@@ -500,8 +505,9 @@ struct fetcher {
         return false;
     }
 
-    // returns when the final file may exist, the lock is gone, or it was taken over
-    void wait_owner() {
+    // returns when the final file may exist, the lock is gone, or it was taken over: 0, or the errno of
+    // the failed takeover of a stale lock
+    int wait_owner() {
         std::string owner;
         read_text(lock + "/owner", owner);
         LOG_INF("model cache: waiting for %s\n", owner.empty() ? "the lock owner" : owner.c_str());
@@ -510,12 +516,12 @@ struct fetcher {
         for (bool first = true; ; first = false) {
             std::this_thread::sleep_for(std::chrono::seconds(POLL_SECONDS));
             if (path_exists(final_path)) {
-                return;
+                return 0;
             }
             // an empty owner file is a lock too: its owner died before it wrote the token
             if (!read_text(lock + "/owner", owner)) {
                 LOG_INF("model cache: lock released without %s\n", final_path.c_str());
-                return;
+                return 0;
             }
             std::string beat;
             read_text(lock + "/beat", beat);
@@ -531,7 +537,9 @@ struct fetcher {
             const std::string stale = dir + "/." + sha + ".lock.stale." + me;
             std::error_code ec;
             fs::remove_all(stale, ec);
-            if (rename(lock.c_str(), stale.c_str()) == 0) {
+            // ENOENT: the lock was released or taken over by another process meanwhile
+            const int err = rename(lock.c_str(), stale.c_str()) == 0 ? 0 : errno;
+            if (err == 0) {
                 std::string moved;
                 read_text(stale + "/owner", moved);
                 if (moved == owner) {
@@ -546,29 +554,46 @@ struct fetcher {
                 }
             }
             fs::remove_all(stale, ec);
-            return;
+            return err == ENOENT ? 0 : err;
         }
+    }
+
+    // a transient error (EIO, ESTALE, as from NFS mounted soft) is tried again a few times, other errors fail
+    void transient(int err, int & n_transient, const std::string & what) {
+        if ((err != EIO && err != ESTALE) || ++n_transient == MAX_ATTEMPTS) {
+            throw std::runtime_error(what + " in " + dir + ": " + strerror(err));
+        }
+        LOG_WRN("model cache: %s in %s: %s, trying again\n", what.c_str(), dir.c_str(), strerror(err));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     void run() {
         int tries = 0;
+        int n_transient = 0;
         while (true) {
             if (check_final()) {
                 return;
             }
-            if (take_lock()) {
+            const int err = take_lock();
+            if (err == 0) {
                 own();
                 return;
             }
+            if (err != EEXIST) {
+                transient(err, n_transient, "cannot create the lock " + lock + "/owner");
+                continue;
+            }
             if (!path_exists(lock + "/owner")) {
-                // released just now, or the lock cannot be created here
+                // released just now
                 if (++tries == 3) {
                     throw std::runtime_error("cannot create " + lock + "/owner");
                 }
                 continue;
             }
             tries = 0;
-            wait_owner();
+            if (const int err_wait = wait_owner(); err_wait != 0) {
+                transient(err_wait, n_transient, "cannot take over the stale lock " + lock);
+            }
         }
     }
 };

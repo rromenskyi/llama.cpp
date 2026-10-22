@@ -254,6 +254,25 @@ def test_bad_args():
     assert files.gets == {}
 
 
+def test_read_only_cache_fails(tmp_path):
+    # an error other than an existing lock fails the start at once instead of waiting forever
+    global server
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode")
+    os.makedirs(cache)
+    os.chmod(cache, 0o555)
+    server.log_path = str(tmp_path / "server.log")
+    t_start = time.time()
+    try:
+        assert start_fails(server) != 0
+    finally:
+        os.chmod(cache, 0o755)
+    assert time.time() - t_start < 10
+    assert files.gets == {}
+    log = open(server.log_path).read()
+    assert f"cannot create the lock {cache}/.{SHA['/model']}.lock/owner in {cache}: Permission denied" in log
+
+
 @pytest.mark.slow
 def test_stale_lock_taken_over(tmp_path):
     global server

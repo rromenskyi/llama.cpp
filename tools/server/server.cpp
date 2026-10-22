@@ -281,11 +281,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         return routes.get_health(req);
     };
     server_http_context::handler_t get_health_ready = [&](const server_http_req &) -> server_http_res_ptr {
+        // note: no 503 on drain, a terminating pod stays "serving" so that the router can still save its slots
         if (!ctx_http.is_ready.load()) {
             return health_res("loading");
-        }
-        if (ctx_http.is_draining.load()) {
-            return health_res("draining");
         }
         if (params.stall_ready > 0 && ctx_server.get_stall_ms() >= params.stall_ready * 1000LL) {
             return health_res("stalled");
@@ -301,8 +299,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
     ctx_http.get ("/health",                   ex_wrapper(get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/health/ready",             ex_wrapper(get_health_ready));
-    ctx_http.get ("/health/live",              ex_wrapper(get_health_live));
+    ctx_http.get ("/health/ready",             ex_wrapper(get_health_ready)); // public endpoint (no API key check)
+    ctx_http.get ("/health/live",              ex_wrapper(get_health_live)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));

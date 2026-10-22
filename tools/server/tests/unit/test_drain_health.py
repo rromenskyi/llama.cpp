@@ -66,14 +66,14 @@ def test_no_flags_unchanged():
     assert wait_exit(5) == 0
 
 
-def test_health_ready_live_need_api_key():
+def test_health_endpoints_public():
     global server
     server.api_key = "test-key"
     server.start()
-    assert server.make_request("GET", "/health").status_code == 200
-    for path in ["/health/ready", "/health/live"]:
-        assert server.make_request("GET", path).status_code == 401
-        assert get_health(path).status_code == 200
+    # kubernetes probes send no Authorization header
+    for path in ["/health", "/health/ready", "/health/live"]:
+        assert server.make_request("GET", path).status_code == 200
+    assert server.make_request("GET", "/slots").status_code == 401
 
 
 def test_sigterm_waits_for_stream(monkeypatch):
@@ -105,11 +105,11 @@ def test_second_signal_exits(monkeypatch):
     time.sleep(0.5)
     assert server.process.poll() is None  # draining
     server.process.send_signal(signal.SIGTERM)
-    assert wait_exit(3) is not None
+    assert wait_exit(3) == 1
     thread.join(timeout=10)
 
 
-def test_ready_503_while_draining(monkeypatch):
+def test_health_503_while_draining(monkeypatch):
     global server
     monkeypatch.setenv("LLAMA_SERVER_TEST_DECODE_SLEEP_MS", "50")
     server.drain_propagation = 2
@@ -124,9 +124,9 @@ def test_ready_503_while_draining(monkeypatch):
 
     res = get_health("/health")
     assert res.status_code == 503
-    res = get_health("/health/ready")
-    assert res.status_code == 503
-    assert res.body["reason"] == "draining"
+    assert res.body["error"]["message"] == "draining"
+    # a terminating pod stays "serving" in kubernetes, so that the router can still save its slots
+    assert get_health("/health/ready").status_code == 200
     assert get_health("/health/live").status_code == 200
 
     # new requests are still accepted while the endpoint removal propagates
@@ -201,3 +201,34 @@ def test_ready_no_flap_during_slow_prefill(monkeypatch):
     assert result["res"].body["timings"]["prompt_n"] >= 192
     assert len(codes) > 20
     assert all(code == 200 for code in codes)
+
+
+def test_probes_do_not_delay_exit():
+    global server
+    server.drain_propagation = 1
+    server.server_metrics = True
+    server.start()
+    stop = threading.Event()
+
+    def poll(path):
+        session = requests.Session()
+        while not stop.is_set():
+            try:
+                session.get(server.make_url(path), timeout=1)
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=poll, args=(path,)) for path in ["/health", "/health/ready", "/health/live", "/metrics"] * 8]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    assert server.process is not None
+    server.process.send_signal(signal.SIGTERM)
+    try:
+        # exit after the propagation, not after the probes stop
+        # note: a /metrics request posted after the loop ended waits up to 2 s for its client to go away
+        assert wait_exit(5) == 0
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()

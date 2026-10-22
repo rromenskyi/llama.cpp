@@ -497,11 +497,11 @@ This endpoint is public (no API key check). `/v1/health` also works.
 
 ### GET `/health/ready` and `/health/live`: Readiness and liveness
 
-For readiness and liveness probes. They use the API key like other endpoints and are answered without the inference loop.
+For readiness and liveness probes. Like `/health`, they are public (no API key check) and are answered without the inference loop.
 
-`/health/ready` returns 200 `{"status": "ok"}`, or 503 `{"status": "unavailable", "reason": "..."}` where `reason` is `loading`, `draining`, or `stalled` (a slot is busy and no progress was made for `--stall-ready` seconds). `/health/live` returns 503 with `reason` `stalled` only after `--stall-live` seconds without progress, else 200. Progress is each prompt batch and each generation step sent to decode, and each encoded image chunk.
+`/health/ready` returns 200 `{"status": "ok"}`, or 503 `{"status": "unavailable", "reason": "..."}` where `reason` is `loading` or `stalled` (a slot is busy and no progress was made for `--stall-ready` seconds). It stays 200 during a drain: Kubernetes already removes a terminating pod from routing, and the pod must stay "serving" so that its slots can still be saved. `/health/live` returns 503 with `reason` `stalled` only after `--stall-live` seconds without progress, else 200. Progress is each prompt batch and each generation step sent to decode, and each encoded image chunk.
 
-**Graceful drain:** with `--drain-propagation N`, the first SIGTERM makes `/health` and `/health/ready` return 503. The server keeps accepting requests for N seconds, then answers new POST requests (except `/slots/...`) with 503 `draining`, and exits when no request is in flight. A second SIGTERM or SIGINT exits at once.
+**Graceful drain:** with `--drain-propagation N`, the first SIGTERM makes `/health` return 503 (for generic load balancers). The server keeps accepting requests for N seconds, then answers new POST requests (except `/slots/...`) with 503 `draining`, and exits when no request is in flight. Requests to `/health`, `/health/ready`, `/health/live` and `/metrics` do not count as in flight. A second SIGTERM or SIGINT exits at once (exit code 1).
 
 ### POST `/completion`: Given a `prompt`, it returns the predicted completion.
 

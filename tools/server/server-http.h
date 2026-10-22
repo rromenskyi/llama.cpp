@@ -73,7 +73,7 @@ struct server_http_context {
     // graceful drain, see --drain-propagation
     std::atomic<bool> is_draining     = false; // /health returns 503
     std::atomic<bool> reject_requests = false; // new requests get 503, except slot management
-    mutable std::atomic<int> n_in_flight = 0;  // requests whose response is not done yet
+    std::atomic<int> n_in_flight = 0;          // requests whose response is not written yet
 
     // note: the handler should never throw exceptions
     using handler_t = std::function<server_http_res_ptr(const server_http_req & req)>;

@@ -25,6 +25,13 @@ public:
     int n_threads_http = 0;
 };
 
+// counts a request while it is alive, see server_http_context::n_in_flight
+struct in_flight_guard {
+    std::atomic<int> & n;
+    explicit in_flight_guard(std::atomic<int> & n) : n(n) { n++; }
+    ~in_flight_guard() { n--; }
+};
+
 class server_http_task_queue : public httplib::TaskQueue {
     httplib::ThreadPool & pool;
 public:
@@ -252,6 +259,8 @@ bool server_http_context::init_listener(const common_params & params) {
         std::unordered_set<std::string> endpoints {
             "/health",
             "/v1/health",
+            "/health/ready",
+            "/health/live",
         };
         endpoints.insert(frontend_paths.begin(), frontend_paths.end());
         return endpoints;
@@ -304,7 +313,21 @@ bool server_http_context::init_listener(const common_params & params) {
         return false;
     };
 
-    auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
+    // probes and metrics scrapes are not work, they must not delay the drain
+    const std::unordered_set<std::string> not_in_flight = {
+        path_prefix + "/health",
+        path_prefix + "/v1/health",
+        path_prefix + "/health/ready",
+        path_prefix + "/health/live",
+        path_prefix + "/metrics",
+    };
+
+    auto middleware_server_state = [this, not_in_flight](const httplib::Request & req, httplib::Response & res) {
+        // httplib destroys res after the response is written, stream included
+        // count before the reject check below, so that the drain never misses an accepted request
+        if (!not_in_flight.count(req.path)) {
+            res.user_data.set("in_flight", std::make_shared<in_flight_guard>(n_in_flight));
+        }
         if (!is_ready.load()) {
             if (frontend_paths.count(req.path)) {
                 return true; // frontend asset, allow it to load and show "loading"
@@ -650,16 +673,7 @@ static std::string build_query_string(const httplib::Request & req) {
 // using unique_ptr for request to allow safe capturing in lambdas
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
-// counts a request from the start of its handler until its response is done
-struct in_flight_guard {
-    std::atomic<int> & n;
-    explicit in_flight_guard(std::atomic<int> & n) : n(n) { n++; }
-    ~in_flight_guard() { n--; }
-};
-
-using in_flight_guard_ptr = std::shared_ptr<in_flight_guard>;
-
-static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res, in_flight_guard_ptr guard) {
+static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
     if (response->is_stream()) {
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response
@@ -685,11 +699,10 @@ static void process_handler_response(server_http_req_ptr && request, server_http
             }
             return has_next;
         };
-        const auto on_complete = [request = q_ptr, response = r_ptr, guard = std::move(guard)](bool) mutable {
+        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
             response->on_complete();
             response.reset();
             request.reset();
-            guard.reset();
         };
         res.set_chunked_content_provider(content_type, chunked_content_provider, on_complete);
     } else {
@@ -702,8 +715,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
-        auto guard = std::make_shared<in_flight_guard>(n_in_flight);
+    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -714,7 +726,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res, std::move(guard));
+        process_handler_response(std::move(request), response, res);
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
@@ -724,8 +736,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
-        auto guard = std::make_shared<in_flight_guard>(n_in_flight);
+    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -766,7 +777,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res, std::move(guard));
+        process_handler_response(std::move(request), response, res);
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
@@ -776,8 +787,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
-        auto guard = std::make_shared<in_flight_guard>(n_in_flight);
+    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -788,7 +798,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res, std::move(guard));
+        process_handler_response(std::move(request), response, res);
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {

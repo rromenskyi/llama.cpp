@@ -243,6 +243,11 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-sps, --slot-prompt-similarity SIMILARITY` | how much the prompt of a request must match the prompt of a slot in order to use that slot (default: 0.10, 0.0 = disabled) |
 | `--lora-init-without-apply` | load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: disabled) |
 | `--sleep-idle-seconds SECONDS` | number of seconds of idleness after which the server will sleep (default: -1; -1 = disabled) |
+| `--drain-propagation N` | on SIGTERM, return 503 on /health at once, keep accepting new requests for N seconds, then exit when no request is in flight (default: 0, 0 = disabled)<br/>(env: LLAMA_ARG_DRAIN_PROPAGATION) |
+| `--drain-idle-exit N` | with a slot store, during drain: exit after N idle seconds once the router is lost (default: 30)<br/>(env: LLAMA_ARG_DRAIN_IDLE_EXIT) |
+| `--router-lost N` | with a slot store: the router is lost after N seconds without contact (default: 90)<br/>(env: LLAMA_ARG_ROUTER_LOST) |
+| `--stall-ready N` | /health/ready returns 503 when a slot is busy and no decode progress was made for N seconds (default: 0, 0 = disabled)<br/>(env: LLAMA_ARG_STALL_READY) |
+| `--stall-live N` | /health/live returns 503 when a slot is busy and no decode progress was made for N seconds (default: 0, 0 = disabled)<br/>(env: LLAMA_ARG_STALL_LIVE) |
 | `--log-prompts-dir PATH` | Log prompts to directory (auto-created if not present; only used for debugging, default: disabled) |
 | `--spec-draft-hf, -hfd, -hfrd, --hf-repo-draft <user>/<model>[:quant]` | Same as --hf-repo, but for the draft model (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_HF_REPO) |
 | `--spec-draft-threads, -td, --threads-draft N` | number of threads to use during generation (default: same as --threads) |
@@ -483,9 +488,20 @@ This endpoint is public (no API key check). `/v1/health` also works.
 - HTTP status code 503
   - Body: `{"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}}`
   - Explanation: the model is still being loaded.
+- HTTP status code 503
+  - Body: `{"error": {"code": 503, "message": "draining", "type": "unavailable_error"}}`
+  - Explanation: the server got SIGTERM with `--drain-propagation` set and is draining.
 - HTTP status code 200
   - Body: `{"status": "ok" }`
   - Explanation: the model is successfully loaded and the server is ready.
+
+### GET `/health/ready` and `/health/live`: Readiness and liveness
+
+For readiness and liveness probes. They use the API key like other endpoints and are answered without the inference loop.
+
+`/health/ready` returns 200 `{"status": "ok"}`, or 503 `{"status": "unavailable", "reason": "..."}` where `reason` is `loading`, `draining`, or `stalled` (a slot is busy and no progress was made for `--stall-ready` seconds). `/health/live` returns 503 with `reason` `stalled` only after `--stall-live` seconds without progress, else 200. Progress is each prompt batch and each generation step sent to decode, and each encoded image chunk.
+
+**Graceful drain:** with `--drain-propagation N`, the first SIGTERM makes `/health` and `/health/ready` return 503. The server keeps accepting requests for N seconds, then answers new POST requests (except `/slots/...`) with 503 `draining`, and exits when no request is in flight. A second SIGTERM or SIGINT exits at once.
 
 ### POST `/completion`: Given a `prompt`, it returns the predicted completion.
 

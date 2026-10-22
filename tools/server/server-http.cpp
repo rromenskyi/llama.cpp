@@ -309,6 +309,9 @@ bool server_http_context::init_listener(const common_params & params) {
             if (frontend_paths.count(req.path)) {
                 return true; // frontend asset, allow it to load and show "loading"
             }
+            if (req.path == path_prefix + "/health/ready" || req.path == path_prefix + "/health/live") {
+                return true; // these report the loading state themselves
+            }
             // no endpoints are allowed to be accessed when the server is not ready
             // this is to prevent any data races or inconsistent states
             res.status = 503;
@@ -316,6 +319,21 @@ bool server_http_context::init_listener(const common_params & params) {
                 safe_json_to_str(json {
                     {"error", {
                         {"message", "Loading model"},
+                        {"type", "unavailable_error"},
+                        {"code", 503}
+                    }}
+                }),
+                "application/json; charset=utf-8"
+            );
+            return false;
+        }
+        // slot save/restore stays open, so that slots can be saved during the drain
+        if (reject_requests.load() && req.method == "POST" && !string_starts_with(req.path, path_prefix + "/slot")) {
+            res.status = 503;
+            res.set_content(
+                safe_json_to_str(json {
+                    {"error", {
+                        {"message", "draining"},
                         {"type", "unavailable_error"},
                         {"code", 503}
                     }}
@@ -632,7 +650,16 @@ static std::string build_query_string(const httplib::Request & req) {
 // using unique_ptr for request to allow safe capturing in lambdas
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
-static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
+// counts a request from the start of its handler until its response is done
+struct in_flight_guard {
+    std::atomic<int> & n;
+    explicit in_flight_guard(std::atomic<int> & n) : n(n) { n++; }
+    ~in_flight_guard() { n--; }
+};
+
+using in_flight_guard_ptr = std::shared_ptr<in_flight_guard>;
+
+static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res, in_flight_guard_ptr guard) {
     if (response->is_stream()) {
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response
@@ -658,10 +685,11 @@ static void process_handler_response(server_http_req_ptr && request, server_http
             }
             return has_next;
         };
-        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
+        const auto on_complete = [request = q_ptr, response = r_ptr, guard = std::move(guard)](bool) mutable {
             response->on_complete();
             response.reset();
             request.reset();
+            guard.reset();
         };
         res.set_chunked_content_provider(content_type, chunked_content_provider, on_complete);
     } else {
@@ -674,7 +702,8 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+        auto guard = std::make_shared<in_flight_guard>(n_in_flight);
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -685,7 +714,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(guard));
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
@@ -695,7 +724,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+        auto guard = std::make_shared<in_flight_guard>(n_in_flight);
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -736,7 +766,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(guard));
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
@@ -746,7 +776,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+        auto guard = std::make_shared<in_flight_guard>(n_in_flight);
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -757,7 +788,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(guard));
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {

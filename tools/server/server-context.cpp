@@ -1019,6 +1019,15 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int test_decode_sleep_ms = 0; // env: LLAMA_SERVER_TEST_DECODE_SLEEP_MS, simulates a slow GPU
+
+    // decode progress, read by the HTTP threads for /health/ready and /health/live
+    std::atomic<bool>    progress_busy = false; // some slot is processing
+    std::atomic<int64_t> t_progress_us = 0;     // last progress while busy
+
+    void mark_progress() {
+        t_progress_us.store(ggml_time_us());
+    }
 
     int n_empty_consecutive = 0;
 
@@ -1479,6 +1488,15 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_TEST_DECODE_SLEEP_MS = getenv("LLAMA_SERVER_TEST_DECODE_SLEEP_MS");
+            test_decode_sleep_ms = LLAMA_SERVER_TEST_DECODE_SLEEP_MS ? atoi(LLAMA_SERVER_TEST_DECODE_SLEEP_MS) : 0;
+
+            if (test_decode_sleep_ms) {
+                SRV_WRN("LLAMA_SERVER_TEST_DECODE_SLEEP_MS = %d\n", test_decode_sleep_ms);
             }
         }
 
@@ -3281,11 +3299,18 @@ private:
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
 
+                progress_busy.store(false);
                 metrics_flush_idle();
 
                 return; // skip further processing
 
             } else {
+                // the start of work counts as progress
+                if (!progress_busy.load()) {
+                    mark_progress();
+                    progress_busy.store(true);
+                }
+
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
@@ -4032,6 +4057,7 @@ private:
                             slot.release();
                             return; // the slot is done, skip it entirely
                         }
+                        mark_progress();
 
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
@@ -4227,6 +4253,9 @@ private:
                 queue_tasks.yield_to_queue([&]() {
                     res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
                 });
+                if (res == 0) {
+                    mark_progress();
+                }
                 embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
             }
 
@@ -4282,11 +4311,19 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            if (test_decode_sleep_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(test_decode_sleep_ms));
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        // each prompt batch and each generation step counts as progress
+        if (ret == 0) {
+            mark_progress();
+        }
 
         if (ret != 0) {
             {
@@ -4793,6 +4830,17 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+bool server_context::is_busy() const {
+    return impl->progress_busy.load();
+}
+
+int64_t server_context::get_stall_ms() const {
+    if (!impl->progress_busy.load()) {
+        return 0;
+    }
+    return (ggml_time_us() - impl->t_progress_us.load()) / 1000;
 }
 
 llama_context * server_context::get_llama_context() const {

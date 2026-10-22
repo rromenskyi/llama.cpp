@@ -662,6 +662,13 @@ struct common_params {
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
+    // graceful drain and progress health (0 = disabled)
+    int drain_propagation = 0;  // on SIGTERM, keep accepting new requests for this many seconds, then exit when idle
+    int drain_idle_exit   = 30; // with a slot store: idle seconds before exit when the router is lost
+    int router_lost       = 90; // with a slot store: seconds without router contact before it is lost
+    int stall_ready       = 0;  // /health/ready is 503 after this many seconds without decode progress
+    int stall_live        = 0;  // /health/live is 503 after this many seconds without decode progress
+
     std::vector<std::string> api_keys;
 
     std::string ssl_file_key  = "";                                                                         // NOLINT

@@ -260,8 +260,49 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
-    ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
+    // graceful drain and progress health, see --drain-propagation, --stall-ready and --stall-live
+    auto health_res = [](const std::string & reason) {
+        auto res = std::make_unique<server_http_res>();
+        if (reason.empty()) {
+            res->data = safe_json_to_str({{"status", "ok"}});
+        } else {
+            res->status = 503;
+            res->data = safe_json_to_str({{"status", "unavailable"}, {"reason", reason}});
+        }
+        return res;
+    };
+    server_http_context::handler_t get_health = [&](const server_http_req & req) -> server_http_res_ptr {
+        if (ctx_http.is_draining.load()) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 503;
+            res->data = safe_json_to_str({{"error", format_error_response("draining", ERROR_TYPE_UNAVAILABLE)}});
+            return res;
+        }
+        return routes.get_health(req);
+    };
+    server_http_context::handler_t get_health_ready = [&](const server_http_req &) -> server_http_res_ptr {
+        if (!ctx_http.is_ready.load()) {
+            return health_res("loading");
+        }
+        if (ctx_http.is_draining.load()) {
+            return health_res("draining");
+        }
+        if (params.stall_ready > 0 && ctx_server.get_stall_ms() >= params.stall_ready * 1000LL) {
+            return health_res("stalled");
+        }
+        return health_res("");
+    };
+    server_http_context::handler_t get_health_live = [&](const server_http_req &) -> server_http_res_ptr {
+        if (params.stall_live > 0 && ctx_server.get_stall_ms() >= params.stall_live * 1000LL) {
+            return health_res("stalled");
+        }
+        return health_res("");
+    };
+
+    ctx_http.get ("/health",                   ex_wrapper(get_health)); // public endpoint (no API key check)
+    ctx_http.get ("/v1/health",                ex_wrapper(get_health)); // public endpoint (no API key check)
+    ctx_http.get ("/health/ready",             ex_wrapper(get_health_ready));
+    ctx_http.get ("/health/live",              ex_wrapper(get_health_live));
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
@@ -497,7 +538,12 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
         SRV_INF("%s", "model loaded\n");
 
-        shutdown_handler = [&](int) {
+        shutdown_handler = [&](int sig) {
+            // with --drain-propagation, the first SIGTERM only starts the drain, drain_thread ends the loop later
+            if (sig == SIGTERM && params.drain_propagation > 0) {
+                ctx_http.is_draining.store(true);
+                return;
+            }
             mcp_mgr.shutdown();
             // this will unblock start_loop()
             ctx_server.terminate();
@@ -543,8 +589,44 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
         }
 
+        // on drain: accept new requests for drain_propagation seconds, then exit when no request is in flight
+        std::atomic<bool> drain_stop = false;
+        std::thread drain_thread;
+        if (params.drain_propagation > 0) {
+            drain_thread = std::thread([&]() {
+                const auto poll = std::chrono::milliseconds(100);
+                while (!ctx_http.is_draining.load()) {
+                    if (drain_stop.load()) {
+                        return;
+                    }
+                    std::this_thread::sleep_for(poll);
+                }
+                SRV_INF("draining, accepting new requests for %d seconds\n", params.drain_propagation);
+                const int64_t t_end = ggml_time_ms() + params.drain_propagation * 1000LL;
+                while (!drain_stop.load()) {
+                    std::this_thread::sleep_for(poll);
+                    if (ggml_time_ms() < t_end) {
+                        continue;
+                    }
+                    if (!ctx_http.reject_requests.exchange(true)) {
+                        SRV_INF("%s", "draining, rejecting new requests\n");
+                    }
+                    if (ctx_http.n_in_flight.load() == 0 && !ctx_server.is_busy()) {
+                        SRV_INF("%s", "drained, exiting\n");
+                        llama_server_terminate();
+                        return;
+                    }
+                }
+            });
+        }
+
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
+
+        drain_stop.store(true);
+        if (drain_thread.joinable()) {
+            drain_thread.join();
+        }
 
         clean_up();
         ctx_http.join();

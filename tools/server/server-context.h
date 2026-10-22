@@ -98,6 +98,12 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // thread-safe: some slot is processing
+    bool is_busy() const;
+
+    // thread-safe: time since the last decode progress while a slot is busy, 0 when idle
+    int64_t get_stall_ms() const;
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

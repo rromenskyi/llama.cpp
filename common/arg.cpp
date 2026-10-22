@@ -3838,6 +3838,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--drain-propagation"}, "N",
+        string_format("on SIGTERM, return 503 on /health at once, keep accepting new requests for N seconds, then exit when no request is in flight (default: %d, 0 = disabled)", params.drain_propagation),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.drain_propagation = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAIN_PROPAGATION"));
+    add_opt(common_arg(
+        {"--drain-idle-exit"}, "N",
+        string_format("with a slot store, during drain: exit after N idle seconds once the router is lost (default: %d)", params.drain_idle_exit),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.drain_idle_exit = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAIN_IDLE_EXIT"));
+    add_opt(common_arg(
+        {"--router-lost"}, "N",
+        string_format("with a slot store: the router is lost after N seconds without contact (default: %d)", params.router_lost),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.router_lost = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ROUTER_LOST"));
+    add_opt(common_arg(
+        {"--stall-ready"}, "N",
+        string_format("/health/ready returns 503 when a slot is busy and no decode progress was made for N seconds (default: %d, 0 = disabled)", params.stall_ready),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.stall_ready = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STALL_READY"));
+    add_opt(common_arg(
+        {"--stall-live"}, "N",
+        string_format("/health/live returns 503 when a slot is busy and no decode progress was made for N seconds (default: %d, 0 = disabled)", params.stall_live),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.stall_live = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STALL_LIVE"));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

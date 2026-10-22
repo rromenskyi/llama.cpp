@@ -1236,7 +1236,7 @@ With `--slot-store DIR --slot-fingerprint FP`, slots are saved to and restored f
 - Every minute, `*.tmp` files older than one hour under `DIR/*/` are removed.
 - The endpoints below need the API key like `/slots`. They are answered on the HTTP threads with file system calls, never by the inference loop. Every slot store request except `GET /slot-store/drained` counts as router contact for the drain, see **Graceful drain**.
 
-`GET /slot-store/info`: `{"fingerprint": FP, "instance": NAME}`, where NAME is `--slot-instance`. It does not touch the disk; a router can use it as its heartbeat.
+`GET /slot-store/info`: `{"fingerprint": FP, "instance": NAME, "boot_id": ID}`, where NAME is `--slot-instance` and ID is a random 16-hex-char id generated when the server process starts (a changed ID means the process restarted and its slots are gone). It does not touch the disk; a router can use it as its heartbeat.
 
 `GET /slot-store`: the slot files of every fingerprint under `DIR`. `mtime` is in unix seconds. Files that vanish during the listing are skipped; other I/O errors give 500.
 

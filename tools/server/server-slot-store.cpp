@@ -50,6 +50,18 @@ std::string slot_store_tmp_path(const std::string & path) {
     return (p.parent_path() / ("." + p.stem().string() + "." + rnd + ".tmp")).string();
 }
 
+// random id generated once per server process, lets a router notice a restart
+static const std::string & slot_store_boot_id() {
+    static const std::string id = [] {
+        std::random_device rd;
+        std::mt19937_64 rng{((uint64_t) rd() << 32) ^ rd()};
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%016" PRIx64, (uint64_t) rng());
+        return std::string(buf);
+    }();
+    return id;
+}
+
 bool slot_store_commit(const std::string & tmp, const std::string & path, std::string & err) {
     // test hook: "before" fails the rename, "after" renames and then reports an error
     static const std::string test_rename_error = [] {
@@ -156,7 +168,7 @@ server_slot_store::server_slot_store(const std::string & dir, const std::string 
 
     get_info = [this](const server_http_req &) {
         router_seen();
-        return make_res({{"fingerprint", this->fingerprint}, {"instance", this->instance}});
+        return make_res({{"fingerprint", this->fingerprint}, {"instance", this->instance}, {"boot_id", slot_store_boot_id()}});
     };
 
     get_list = [this](const server_http_req &) {

@@ -1,5 +1,6 @@
 import os
 import signal
+import re
 import stat
 import subprocess
 import threading
@@ -73,7 +74,16 @@ def test_save_is_atomic_and_listed():
 
     res = server.make_request("GET", "/slot-store/info")
     assert res.status_code == 200
+    boot_id = res.body.pop("boot_id")
     assert res.body == {"fingerprint": FP, "instance": "pod-a"}
+    assert re.fullmatch(r"[0-9a-f]{16}", boot_id)
+    assert server.make_request("GET", "/slot-store/info").body["boot_id"] == boot_id
+
+    # a restarted process reports a different boot id
+    server.stop()
+    server.start()
+    res = server.make_request("GET", "/slot-store/info")
+    assert res.body["boot_id"] != boot_id
 
     fill_slot(1)
     t_save = int(time.time())

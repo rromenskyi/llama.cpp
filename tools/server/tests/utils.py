@@ -121,6 +121,10 @@ class ServerProcess:
     slot_store: str | None = None
     slot_fingerprint: str | None = None
     slot_instance: str | None = None
+    model_cache: str | None = None
+    model_sha256: str | None = None
+    mmproj_sha256: str | None = None
+    model_cache_ttl: int | None = None
     stall_ready: int | None = None
     stall_live: int | None = None
     cache_ram: int | None = None
@@ -308,6 +312,14 @@ class ServerProcess:
             server_args.extend(["--slot-fingerprint", self.slot_fingerprint])
         if self.slot_instance is not None:
             server_args.extend(["--slot-instance", self.slot_instance])
+        if self.model_cache is not None:
+            server_args.extend(["--model-cache", self.model_cache])
+        if self.model_sha256 is not None:
+            server_args.extend(["--model-sha256", self.model_sha256])
+        if self.mmproj_sha256 is not None:
+            server_args.extend(["--mmproj-sha256", self.mmproj_sha256])
+        if self.model_cache_ttl is not None:
+            server_args.extend(["--model-cache-ttl", self.model_cache_ttl])
         if self.stall_ready is not None:
             server_args.extend(["--stall-ready", self.stall_ready])
         if self.stall_live is not None:

@@ -91,6 +91,8 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    model-cache.cpp
+    model-cache.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp
@@ -149,7 +151,7 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC  llama-common-base)
-target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+target_link_libraries(${TARGET} PRIVATE cpp-httplib vendor::hash)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)

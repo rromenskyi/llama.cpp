@@ -711,6 +711,10 @@ struct common_params {
     std::string slot_store;       // shared slot directory, slots are saved to <slot_store>/<slot_fingerprint>/
     std::string slot_fingerprint;
     std::string slot_instance;    // returned by GET /slot-store/info
+    std::string model_cache;      // shared model directory, -mu is downloaded to <model_cache>/<model_sha256>.gguf
+    std::string model_sha256;
+    std::string mmproj_sha256;
+    int64_t     model_cache_ttl = 604800; // remove cached models not used for this many seconds
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

@@ -8,6 +8,7 @@
 #include "json.h"
 #include "llama.h"
 #include "log.h"
+#include "model-cache.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
@@ -340,6 +341,15 @@ static bool parse_bool_value(const std::string & value) {
     }
 }
 
+static std::string parse_sha256(const std::string & value) {
+    std::string sha = value;
+    std::transform(sha.begin(), sha.end(), sha.begin(), ::tolower);
+    if (sha.size() != 64 || sha.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        throw std::invalid_argument("expected a sha256 as 64 hex digits");
+    }
+    return sha;
+}
+
 [[noreturn]] static void arg_removed(const std::string & msg) {
     throw std::invalid_argument("the argument has been removed. " + msg);
 }
@@ -488,8 +498,17 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         params.model.path = get_default_local_path(params.model.url);
     }
 
+    // with --model-cache, the model and mmproj urls are fetched into the shared cache instead
+    if (!params.model_cache.empty()) {
+        std::vector<common_model_cache_file> files = {{params.model.url, params.model_sha256}};
+        if (!params.mmproj.url.empty()) {
+            files.push_back({params.mmproj.url, params.mmproj_sha256});
+        }
+        common_model_cache_get(params.model_cache, files, params.model_cache_ttl, opts);
+    }
+
     // handle plain "url" tasks (non-hf)
-    if (!params.model.url.empty()) {
+    if (!params.model.url.empty() && params.model_cache.empty()) {
         auto url_tasks = build_url_tasks(params.model, opts);
         // the first part is what gets loaded, so point params.model.path at it
         if (!url_tasks.empty()) {
@@ -500,7 +519,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             tasks.push_back(std::move(task));
         }
     }
-    if (!params.mmproj.url.empty()) {
+    if (!params.mmproj.url.empty() && params.model_cache.empty()) {
         common_download_task task;
         task.url        = params.mmproj.url;
         task.local_path = params.mmproj.path;
@@ -904,6 +923,24 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
     if (!params.slot_store.empty() && !params.slot_save_path.empty()) {
         throw std::invalid_argument("error: --slot-store cannot be used with --slot-save-path\n");
+    }
+
+    if (!params.model_cache.empty()) {
+        if (params.model.url.empty() || params.model_sha256.empty()) {
+            throw std::invalid_argument("error: --model-cache needs --model-url and --model-sha256\n");
+        }
+        if (!params.model.path.empty() || !params.model.hf_repo.empty() || !params.model.docker_repo.empty()) {
+            throw std::invalid_argument("error: --model-cache cannot be used with --model, --hf-repo or --docker-repo\n");
+        }
+        if (params.mmproj.url.empty() != params.mmproj_sha256.empty()) {
+            throw std::invalid_argument("error: with --model-cache, --mmproj-url and --mmproj-sha256 must be used together\n");
+        }
+        params.model.path = common_model_cache_path(params.model_cache, params.model_sha256);
+        if (!params.mmproj.url.empty()) {
+            params.mmproj.path = common_model_cache_path(params.model_cache, params.mmproj_sha256);
+        }
+    } else if (!params.model_sha256.empty() || !params.mmproj_sha256.empty()) {
+        throw std::invalid_argument("error: --model-sha256 and --mmproj-sha256 need --model-cache\n");
     }
 
     const bool skip_model_download =
@@ -3673,6 +3710,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_instance = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_INSTANCE"));
+    add_opt(common_arg(
+        {"--model-cache"}, "PATH",
+        "shared directory for models, needs -mu and --model-sha256; the model is downloaded once to PATH/<sha256>.gguf and verified at every start (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.model_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODEL_CACHE"));
+    add_opt(common_arg(
+        {"--model-sha256"}, "HEX",
+        "sha256 of the file at -mu, for --model-cache",
+        [](common_params & params, const std::string & value) {
+            params.model_sha256 = parse_sha256(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODEL_SHA256"));
+    add_opt(common_arg(
+        {"--mmproj-sha256"}, "HEX",
+        "sha256 of the file at --mmproj-url, for --model-cache",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_sha256 = parse_sha256(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_SHA256"));
+    add_opt(common_arg(
+        {"--model-cache-ttl"}, "N",
+        string_format("remove files from --model-cache that no server used for N seconds (default: %lld)", (long long) params.model_cache_ttl),
+        [](common_params & params, int value) {
+            params.model_cache_ttl = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODEL_CACHE_TTL"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",

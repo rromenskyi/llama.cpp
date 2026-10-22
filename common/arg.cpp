@@ -24,6 +24,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -343,7 +344,7 @@ static bool parse_bool_value(const std::string & value) {
 
 static std::string parse_sha256(const std::string & value) {
     std::string sha = value;
-    std::transform(sha.begin(), sha.end(), sha.begin(), ::tolower);
+    std::transform(sha.begin(), sha.end(), sha.begin(), [](unsigned char c) { return (char) std::tolower(c); });
     if (sha.size() != 64 || sha.find_first_not_of("0123456789abcdef") != std::string::npos) {
         throw std::invalid_argument("expected a sha256 as 64 hex digits");
     }
@@ -3735,6 +3736,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--model-cache-ttl"}, "N",
         string_format("remove files from --model-cache that no server used for N seconds (default: %lld)", (long long) params.model_cache_ttl),
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--model-cache-ttl must not be negative");
+            }
             params.model_cache_ttl = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODEL_CACHE_TTL"));

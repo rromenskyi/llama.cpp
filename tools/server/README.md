@@ -1250,7 +1250,7 @@ With `--slot-store DIR --slot-fingerprint FP`, slots are saved to and restored f
 
 ### Model cache: models on a shared directory
 
-With `--model-cache DIR -mu URL --model-sha256 HEX`, the model is `DIR/<sha256>.gguf`, and `DIR` can be shared by many servers on many hosts (for example a soft-mounted NFS volume). `--mmproj-url URL --mmproj-sha256 HEX` adds a multimodal projector the same way. The cache cannot be used with `-m`, `-hf` or `-dr`, and only holds single-file models. Without `--model-cache`, `-mu` works as before.
+With `--model-cache DIR -mu URL --model-sha256 HEX`, the model is `DIR/<sha256>.gguf`, and `DIR` can be shared by many servers on many hosts (for example a soft-mounted NFS volume). `--mmproj-url URL --mmproj-sha256 HEX` adds a multimodal projector the same way. The cache cannot be used with `-m`, `-hf` or `-dr`, and only holds single-file models (a split GGUF is not supported). `--offline` is ignored in cache mode: the cache always verifies and, when needed, downloads. Without `--model-cache`, `-mu` works as before.
 
 - At every start the cached file is hashed. A file with the wrong hash is moved aside, hashed again (another server may have replaced it meanwhile), deleted if it is still wrong, and downloaded again.
 - One server downloads at a time: the lock is `DIR/.<sha256>.lock/owner`, created with `O_EXCL`. The owner writes the number of bytes hashed and downloaded to `DIR/.<sha256>.lock/beat` every 10 s. A server that sees no change of the owner and beat for 120 s on its own clock takes the lock over.

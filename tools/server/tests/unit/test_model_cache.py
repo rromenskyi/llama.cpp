@@ -188,6 +188,33 @@ def test_bad_cached_file_replaced(tmp_path):
     assert "mismatch" in open(tmp_path / "server.log").read()
 
 
+def test_servers_start_on_one_bad_file(tmp_path):
+    # the servers hash the same bad file at once and race to move it aside
+    write_file(final(), os.urandom(64 << 20))
+    servers = [make_server(i) for i in range(3)]
+    errors = []
+
+    def run(s: ServerProcess, i: int):
+        s.log_path = str(tmp_path / f"server{i}.log")
+        try:
+            s.start()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(s, i)) for i, s in enumerate(servers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert files.gets == {"/model": 1}
+    assert listing() == [SHA["/model"] + ".gguf"]
+    assert sha_of(final()) == SHA["/model"]
+    for s in servers:
+        res = s.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
+        assert res.status_code == 200
+
+
 def test_bad_file_published_during_download(tmp_path):
     global server
     # another process publishes a bad file while this one downloads
@@ -220,6 +247,9 @@ def test_bad_args():
     server.model_sha256 = "abc"
     assert start_fails(server) != 0
     server.model_sha256 = None
+    assert start_fails(server) != 0
+    server.model_sha256 = SHA["/model"]
+    server.model_cache_ttl = -1
     assert start_fails(server) != 0
     assert files.gets == {}
 

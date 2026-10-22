@@ -51,6 +51,7 @@ static constexpr int     POLL_SECONDS      = 5;
 static constexpr int     LOW_SPEED_SECONDS = 60;
 static constexpr int64_t LOW_SPEED_BYTES   = 100 * 1024; // per second
 static constexpr int     MAX_ATTEMPTS      = 3;
+static constexpr int     HASH_ATTEMPTS     = 3;
 static constexpr int64_t LEFTOVER_MAX_AGE  = 3600;
 static constexpr int     TOUCH_SECONDS     = 24 * 3600;
 
@@ -89,7 +90,7 @@ static bool read_text(const std::string & path, std::string & out) {
     if (!f) {
         return false;
     }
-    char buf[256];
+    char buf[1024];
     size_t n = fread(buf, 1, sizeof(buf), f);
     fclose(f);
     out.assign(buf, n);
@@ -168,12 +169,18 @@ static void evict(const std::string & dir, const std::set<std::string> & keep, i
                 if (now - newest_mtime(path) > LEFTOVER_MAX_AGE) {
                     LOG_INF("model cache: removing leftover %s\n", path.c_str());
                     fs::remove_all(path, ec);
+                    if (ec) {
+                        LOG_WRN("model cache: cannot remove %s: %s\n", path.c_str(), ec.message().c_str());
+                    }
                 }
             } else if (name.size() == 69 && is_hex64(name, 0) && name.compare(64, 5, ".gguf") == 0 && keep.count(name) == 0) {
+                // stat right before unlink: another process may have touched the file since the listing
                 struct stat st;
                 if (stat(path.c_str(), &st) == 0 && now - st.st_mtime > ttl_s) {
                     LOG_INF("model cache: removing %s, not used for %lld s\n", path.c_str(), (long long) (now - st.st_mtime));
-                    unlink(path.c_str());
+                    if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+                        LOG_WRN("model cache: cannot remove %s: %s\n", path.c_str(), strerror(errno));
+                    }
                 }
             }
         }
@@ -229,25 +236,41 @@ struct fetcher {
         }
     }
 
-    bool hash_file(const std::string & path, std::string & out) {
+    // returns 0, or the errno of the failed open or read
+    int hash_once(const std::string & path, std::string & out) {
         FILE * f = fopen(path.c_str(), "rb");
         if (!f) {
-            return false;
+            return errno;
         }
         sha256_t ctx;
         sha256_init(&ctx);
         std::vector<unsigned char> buf(1 << 20);
         size_t n;
+        errno = 0;
         while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
             sha256_update(&ctx, buf.data(), n);
             progress += n;
         }
-        const bool ok = !ferror(f);
+        const int err = ferror(f) ? (errno ? errno : EIO) : 0;
         fclose(f);
-        if (ok) {
+        if (err == 0) {
             out = to_hex(ctx);
         }
-        return ok;
+        return err;
+    }
+
+    // like hash_once, but tries again after a transient read error
+    int hash_file(const std::string & path, std::string & out) {
+        int err = 0;
+        for (int attempt = 1; attempt <= HASH_ATTEMPTS; attempt++) {
+            err = hash_once(path, out);
+            if ((err != EIO && err != ESTALE) || attempt == HASH_ATTEMPTS) {
+                break;
+            }
+            LOG_WRN("model cache: cannot read %s: %s, trying again\n", path.c_str(), strerror(err));
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        return err;
     }
 
     // true: the final file is good, false: there is no good final file; throws when it cannot be read
@@ -262,8 +285,13 @@ struct fetcher {
             touch(final_path);
             LOG_INF("model cache: verifying %s\n", final_path.c_str());
             std::string got;
-            if (!hash_file(final_path, got)) {
-                throw std::runtime_error("cannot read " + final_path + ": " + strerror(errno));
+            const int err = hash_file(final_path, got);
+            if (err == ENOENT || err == ESTALE) {
+                // another process moved it aside meanwhile
+                continue;
+            }
+            if (err != 0) {
+                throw std::runtime_error("cannot read " + final_path + ": " + strerror(err));
             }
             if (got == sha) {
                 LOG_INF("model cache: verified %s\n", final_path.c_str());
@@ -275,8 +303,8 @@ struct fetcher {
             if (!path_exists(aside)) {
                 continue;
             }
-            if (!hash_file(aside, got)) {
-                throw std::runtime_error("cannot read " + aside + ", leaving it there");
+            if (const int err = hash_file(aside, got); err != 0) {
+                throw std::runtime_error("cannot read " + aside + ": " + strerror(err) + ", leaving it there");
             }
             if (got != sha) {
                 LOG_INF("model cache: removing bad %s\n", aside.c_str());
@@ -284,7 +312,7 @@ struct fetcher {
                 continue;
             }
             LOG_INF("model cache: %s was replaced with a good file meanwhile, putting it back\n", final_path.c_str());
-            if (link(aside.c_str(), final_path.c_str()) == 0 || (hash_file(final_path, got) && got == sha)) {
+            if (link(aside.c_str(), final_path.c_str()) == 0 || (hash_file(final_path, got) == 0 && got == sha)) {
                 unlink(aside.c_str());
                 LOG_INF("model cache: verified %s\n", final_path.c_str());
                 return true;
@@ -304,7 +332,11 @@ struct fetcher {
         }
         const std::string line = token + "\n";
         const bool ok = write_all(fd, line.data(), line.size());
-        return close(fd) == 0 && ok;
+        if (close(fd) != 0 || !ok) {
+            unlink((lock + "/owner").c_str());
+            return false;
+        }
+        return true;
     }
 
     bool holds_lock() {
@@ -340,9 +372,12 @@ struct fetcher {
             cv.notify_all();
             beat.join();
             unlink(tmp.c_str());
+            // release: the owner file goes last, a new owner may create it right after
             if (holds_lock()) {
-                std::error_code ec;
-                fs::remove_all(lock, ec);
+                unlink((lock + "/beat").c_str());
+                unlink((lock + "/beat.tmp").c_str());
+                unlink((lock + "/owner").c_str());
+                rmdir(lock.c_str());
             }
         }};
 
@@ -505,7 +540,9 @@ struct fetcher {
                     // the stale lock was released and a new one taken meanwhile: put it back unless yet
                     // another lock holds the name (then the worst case is a duplicate download)
                     LOG_WRN("model cache: moved the fresh lock of %s, putting it back\n", moved.c_str());
-                    rename(stale.c_str(), lock.c_str());
+                    if (!path_exists(lock)) {
+                        rename(stale.c_str(), lock.c_str());
+                    }
                 }
             }
             fs::remove_all(stale, ec);
@@ -550,6 +587,8 @@ void common_model_cache_get(const std::string & dir, const std::vector<common_mo
     for (const auto & f : files) {
         keep.insert(f.sha256 + ".gguf");
         paths.push_back(common_model_cache_path(dir, f.sha256));
+        // so that another process starting now does not evict it
+        touch(paths.back());
     }
     evict(dir, keep, ttl_s);
 

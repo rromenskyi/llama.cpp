@@ -313,7 +313,7 @@ bool server_http_context::init_listener(const common_params & params) {
         return false;
     };
 
-    // probes and metrics scrapes are not work, they must not delay the drain
+    // probes, metrics scrapes and local reads of the drained flag are not work, they must not delay the drain
     const std::unordered_set<std::string> not_in_flight = {
         path_prefix + "/health",
         path_prefix + "/v1/health",
@@ -321,11 +321,12 @@ bool server_http_context::init_listener(const common_params & params) {
         path_prefix + "/health/live",
         path_prefix + "/metrics",
     };
+    const std::string path_drained = path_prefix + "/slot-store/drained";
 
-    auto middleware_server_state = [this, not_in_flight](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_server_state = [this, not_in_flight, path_drained](const httplib::Request & req, httplib::Response & res) {
         // httplib destroys res after the response is written, stream included
         // count before the reject check below, so that the drain never misses an accepted request
-        if (!not_in_flight.count(req.path)) {
+        if (!not_in_flight.count(req.path) && !(req.method == "GET" && req.path == path_drained)) {
             res.user_data.set("in_flight", std::make_shared<in_flight_guard>(n_in_flight));
         }
         if (!is_ready.load()) {

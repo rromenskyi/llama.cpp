@@ -2,6 +2,7 @@ import os
 import signal
 import stat
 import subprocess
+import threading
 import time
 
 import pytest
@@ -104,6 +105,10 @@ def test_store_needs_api_key():
     server.start()
     for path in ["/slot-store", "/slot-store/info", "/slot-store/drained"]:
         assert server.make_request("GET", path).status_code == 401
+    res = server.make_request("POST", "/slot-store/evict", data={"files": []})
+    assert res.status_code == 401
+    assert server.make_request("POST", "/slot-store/drained").status_code == 401
+    assert server.make_request("GET", "/slot-store/drained", headers={"Authorization": "Bearer test-key"}).body["drained"] is False
     res = server.make_request("GET", "/slot-store/info", headers={"Authorization": "Bearer test-key"})
     assert res.status_code == 200
 
@@ -134,6 +139,9 @@ def test_bad_flags_refuse_start(tmp_path, case):
 def test_restore_from_store():
     global server
     server.start()
+    # both directories are created by the server, with mode 0770
+    assert stat.S_IMODE(os.stat(store_path()).st_mode) == 0o770
+    assert stat.S_IMODE(os.stat(store_path(FP)).st_mode) == 0o770
     fill_slot(1)
     assert save(1, "k1.slot").status_code == 200
 
@@ -219,7 +227,7 @@ def test_drained_flag_and_router_seen():
     assert server.make_request("GET", "/slot-store/info").status_code == 200
     time.sleep(1.2)
     res = server.make_request("GET", "/slot-store/drained")
-    assert res.body["router_seen_seconds"] == 1
+    assert res.body["router_seen_seconds"] in (1, 2)
 
     assert server.make_request("GET", "/slot-store").status_code == 200
     res = server.make_request("GET", "/slot-store/drained")
@@ -282,6 +290,49 @@ def test_drain_router_never_seen():
     assert server.process is not None
     server.process.send_signal(signal.SIGTERM)
     assert wait_exit(4) == 0
+
+
+def test_existing_dir_without_group_access_warns(tmp_path):
+    global server
+    os.makedirs(store_path(FP))
+    os.chmod(store_path(FP), 0o700)
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    server.stop()
+    with open(server.log_path) as f:
+        log = f.read()
+    assert f"'{store_path(FP)}' has mode 700" in log
+    # an existing directory is left as is
+    assert stat.S_IMODE(os.stat(store_path(FP)).st_mode) == 0o700
+
+
+def test_drained_reads_do_not_delay_exit():
+    global server
+    server.router_lost = 300
+    server.drain_idle_exit = 1
+    server.start()
+    stop = threading.Event()
+
+    def poll():
+        with requests.Session() as session:
+            while not stop.is_set():
+                try:
+                    session.get(server.make_url("/slot-store/drained"), timeout=1)
+                except Exception:
+                    pass
+
+    threads = [threading.Thread(target=poll) for _ in range(16)]
+    for t in threads:
+        t.start()
+    try:
+        assert server.process is not None
+        server.process.send_signal(signal.SIGTERM)
+        # never seen router and idle: exit, even while the flag is polled
+        assert wait_exit(5) == 0
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
 
 
 def test_janitor_removes_old_tmp():

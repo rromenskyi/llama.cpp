@@ -115,10 +115,17 @@ static bool is_vanished(const std::error_code & ec) {
 }
 
 // creates the directory with mode 0770, the umask must not take the group bits away
+// an existing directory is left as is, on a shared volume it can belong to another user
 static void make_dir(const fs::path & path) {
     std::error_code ec;
     if (fs::create_directory(path, ec)) {
         fs::permissions(path, fs::perms::owner_all | fs::perms::group_all, fs::perm_options::replace, ec);
+    } else if (!ec) {
+        const fs::perms perms = fs::status(path, ec).permissions();
+        if (!ec && (perms & fs::perms::group_all) != fs::perms::group_all) {
+            SRV_WRN("slot store: '%s' has mode %03o, other servers of the group may not be able to use it\n",
+                    path.string().c_str(), (unsigned) (perms & fs::perms::mask));
+        }
     }
     if (ec) {
         throw std::runtime_error("cannot create '" + path.string() + "': " + ec.message());
@@ -237,7 +244,7 @@ server_slot_store::server_slot_store(const std::string & dir, const std::string 
         return make_res({{"removed", n_removed}});
     };
 
-    // note: not router contact, so that a local reader does not keep the drain waiting
+    // note: not router contact, and not counted in flight (see server-http.cpp), so that local polling neither hides a lost router nor resets the drain idle time
     get_drained = [this](const server_http_req &) {
         const int64_t t = t_router_seen_ms.load();
         return make_res({

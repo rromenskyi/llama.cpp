@@ -254,6 +254,16 @@ def test_bad_args():
     assert files.gets == {}
 
 
+def test_ttl_too_short(tmp_path):
+    # a ttl shorter than the touch interval of the other servers would evict files in use
+    global server
+    server.log_path = str(tmp_path / "server.log")
+    server.model_cache_ttl = 3599
+    assert start_fails(server) != 0
+    assert files.gets == {}
+    assert "--model-cache-ttl must be at least 3600 seconds" in open(server.log_path).read()
+
+
 def test_read_only_cache_fails(tmp_path):
     # an error other than an existing lock fails the start at once instead of waiting forever
     global server
@@ -340,8 +350,8 @@ def test_ttl_eviction():
 def test_ttl_option():
     global server
     other = "1" * 64
-    write_file(os.path.join(cache, f"{other}.gguf"), age_s=120)
-    server.model_cache_ttl = 60
+    write_file(os.path.join(cache, f"{other}.gguf"), age_s=7200)
+    server.model_cache_ttl = 3600
     server.start()
     assert listing() == [SHA["/model"] + ".gguf"]
 

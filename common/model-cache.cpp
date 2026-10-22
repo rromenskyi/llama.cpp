@@ -24,6 +24,7 @@ extern "C" {
 #include "hash/sha256/sha256.h"
 }
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -624,9 +625,11 @@ void common_model_cache_get(const std::string & dir, const std::vector<common_mo
     for (const auto & p : paths) {
         touch(p);
     }
-    std::thread([paths] {
+    // touched well within the ttl, so that a server with a shorter ttl does not evict a file in use
+    const int64_t touch_s = std::min<int64_t>(TOUCH_SECONDS, std::max<int64_t>(ttl_s / 4, 1));
+    std::thread([paths, touch_s] {
         while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(TOUCH_SECONDS));
+            std::this_thread::sleep_for(std::chrono::seconds(touch_s));
             for (const auto & p : paths) {
                 touch(p);
             }

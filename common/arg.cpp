@@ -3734,10 +3734,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_SHA256"));
     add_opt(common_arg(
         {"--model-cache-ttl"}, "N",
-        string_format("remove files from --model-cache that no server used for N seconds (default: %lld)", (long long) params.model_cache_ttl),
+        string_format("remove files from --model-cache that no server used for N seconds, at least 3600 (default: %lld)", (long long) params.model_cache_ttl),
         [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("--model-cache-ttl must not be negative");
+            // servers in use touch their files every min(24 h, ttl / 4), a shorter ttl leaves too little margin
+            if (value < 3600) {
+                throw std::invalid_argument("--model-cache-ttl must be at least 3600 seconds");
             }
             params.model_cache_ttl = value;
         }

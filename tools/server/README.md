@@ -230,7 +230,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--model-cache PATH` | shared directory for models, needs -mu and --model-sha256; the model is downloaded once to PATH/<sha256>.gguf and verified at every start (default: disabled)<br/>(env: LLAMA_ARG_MODEL_CACHE) |
 | `--model-sha256 HEX` | sha256 of the file at -mu, for --model-cache<br/>(env: LLAMA_ARG_MODEL_SHA256) |
 | `--mmproj-sha256 HEX` | sha256 of the file at --mmproj-url, for --model-cache<br/>(env: LLAMA_ARG_MMPROJ_SHA256) |
-| `--model-cache-ttl N` | remove files from --model-cache that no server used for N seconds (default: 604800)<br/>(env: LLAMA_ARG_MODEL_CACHE_TTL) |
+| `--model-cache-ttl N` | remove files from --model-cache that no server used for N seconds, at least 3600 (default: 604800)<br/>(env: LLAMA_ARG_MODEL_CACHE_TTL) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1255,7 +1255,7 @@ With `--model-cache DIR -mu URL --model-sha256 HEX`, the model is `DIR/<sha256>.
 - At every start the cached file is hashed. A file with the wrong hash is moved aside, hashed again (another server may have replaced it meanwhile), deleted if it is still wrong, and downloaded again.
 - One server downloads at a time: the lock is `DIR/.<sha256>.lock/owner`, created with `O_EXCL`. The owner writes the number of bytes hashed and downloaded to `DIR/.<sha256>.lock/beat` every 10 s. A server that sees no change of the owner and beat for 120 s on its own clock takes the lock over. An error other than an existing lock when creating or taking over the lock (for example a read-only directory) fails the start; EIO and ESTALE are tried 3 times.
 - The lock only saves duplicate downloads. A download is hashed while it is written to `DIR/.<sha256>.<owner>.tmp`, synced with fsync, and gets the final name with `link()`, which never replaces an existing file. A partial download is never resumed. A download slower than 100 KiB/s for 60 s is stopped; failed downloads are tried 3 times, except on a 4xx status. The query string of the URL is not logged.
-- Each server touches the mtime of the files it uses at start and once a day. At start it removes `DIR/<sha256>.gguf` files not touched for `--model-cache-ttl` seconds (default: 7 days), never its own, and leftovers `DIR/.<sha256>.*` (temporary, moved-aside, and lock files) not changed for one hour.
+- Each server touches the mtime of the files it uses at start and every min(24 h, `--model-cache-ttl` / 4). At start it removes `DIR/<sha256>.gguf` files not touched for `--model-cache-ttl` seconds (default: 7 days), never its own, and leftovers `DIR/.<sha256>.*` (temporary, moved-aside, and lock files) not changed for one hour.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

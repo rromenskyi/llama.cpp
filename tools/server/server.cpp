@@ -2,6 +2,7 @@
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
+#include "server-slot-store.h"
 #include "server-stream.h"
 #include "server-tools.h"
 
@@ -194,6 +195,23 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     // note: this is guaranteed to out-live ctx_http and tools
     server_mcp mcp_mgr;
 
+    // shared slot directory, see --slot-store
+    std::unique_ptr<server_slot_store> slot_store;
+    if (!params.slot_store.empty()) {
+        if (is_router_server) {
+            SRV_ERR("%s", "--slot-store is not supported in router mode\n");
+            return 1;
+        }
+        try {
+            slot_store = std::make_unique<server_slot_store>(params.slot_store, params.slot_fingerprint, params.slot_instance);
+        } catch (const std::exception & e) {
+            SRV_ERR("slot store: %s\n", e.what());
+            return 1;
+        }
+        params.slot_save_path = slot_store->save_path();
+        SRV_INF("slot store: saving slots to '%s'\n", params.slot_save_path.c_str());
+    }
+
     // struct that contains llama context and inference
     server_context ctx_server;
 
@@ -341,6 +359,13 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    if (slot_store) {
+        ctx_http.get ("/slot-store",           ex_wrapper(slot_store->get_list));
+        ctx_http.get ("/slot-store/info",      ex_wrapper(slot_store->get_info));
+        ctx_http.post("/slot-store/evict",     ex_wrapper(slot_store->post_evict));
+        ctx_http.get ("/slot-store/drained",   ex_wrapper(slot_store->get_drained));
+        ctx_http.post("/slot-store/drained",   ex_wrapper(slot_store->post_drained));
+    }
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h
@@ -537,8 +562,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         SRV_INF("%s", "model loaded\n");
 
         shutdown_handler = [&](int sig) {
-            // with --drain-propagation, the first SIGTERM only starts the drain, drain_thread ends the loop later
-            if (sig == SIGTERM && params.drain_propagation > 0) {
+            // with --drain-propagation or --slot-store, the first SIGTERM only starts the drain, drain_thread ends the loop later
+            if (sig == SIGTERM && (params.drain_propagation > 0 || slot_store)) {
                 ctx_http.is_draining.store(true);
                 return;
             }
@@ -588,9 +613,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         }
 
         // on drain: accept new requests for drain_propagation seconds, then exit when no request is in flight
+        // with a slot store, also wait for the router's drained flag, or for idle time once the router is lost
         std::atomic<bool> drain_stop = false;
         std::thread drain_thread;
-        if (params.drain_propagation > 0) {
+        if (params.drain_propagation > 0 || slot_store) {
             drain_thread = std::thread([&]() {
                 const auto poll = std::chrono::milliseconds(100);
                 while (!ctx_http.is_draining.load()) {
@@ -601,19 +627,31 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
                 }
                 SRV_INF("draining, accepting new requests for %d seconds\n", params.drain_propagation);
                 const int64_t t_end = ggml_time_ms() + params.drain_propagation * 1000LL;
+                int64_t t_idle = ggml_time_ms(); // start of the current idle period
                 while (!drain_stop.load()) {
                     std::this_thread::sleep_for(poll);
-                    if (ggml_time_ms() < t_end) {
-                        continue;
-                    }
-                    if (!ctx_http.reject_requests.exchange(true)) {
+                    const int64_t t_now = ggml_time_ms();
+                    // note: set the reject flag before reading n_in_flight, see the middleware
+                    if (t_now >= t_end && !ctx_http.reject_requests.exchange(true)) {
                         SRV_INF("%s", "draining, rejecting new requests\n");
                     }
-                    if (ctx_http.n_in_flight.load() == 0 && !ctx_server.is_busy()) {
-                        SRV_INF("%s", "drained, exiting\n");
-                        llama_server_terminate();
-                        return;
+                    if (ctx_http.n_in_flight.load() != 0 || ctx_server.is_busy()) {
+                        t_idle = t_now;
+                        continue;
                     }
+                    if (t_now < t_end) {
+                        continue;
+                    }
+                    if (slot_store && !slot_store->drained.load()) {
+                        if (!slot_store->router_lost(params.router_lost * 1000LL) || t_now - t_idle < params.drain_idle_exit * 1000LL) {
+                            continue;
+                        }
+                        SRV_INF("%s", "router lost and idle, exiting\n");
+                    } else {
+                        SRV_INF("%s", "drained, exiting\n");
+                    }
+                    llama_server_terminate();
+                    return;
                 }
             });
         }

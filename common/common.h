@@ -708,6 +708,9 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string slot_store;       // shared slot directory, slots are saved to <slot_store>/<slot_fingerprint>/
+    std::string slot_fingerprint;
+    std::string slot_instance;    // returned by GET /slot-store/info
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

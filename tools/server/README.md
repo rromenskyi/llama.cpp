@@ -224,6 +224,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_PATH) |
+| `--slot-store PATH` | shared directory for slot files, needs --slot-fingerprint; slots are saved atomically to PATH/FP/ (default: disabled)<br/>(env: LLAMA_ARG_SLOT_STORE) |
+| `--slot-fingerprint FP` | slot store subdirectory for this server, must change when saved slots are no longer valid<br/>(env: LLAMA_ARG_SLOT_FINGERPRINT) |
+| `--slot-instance NAME` | name of this server returned by GET /slot-store/info, e.g. the pod name (default: empty)<br/>(env: LLAMA_ARG_SLOT_INSTANCE) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -490,7 +493,7 @@ This endpoint is public (no API key check). `/v1/health` also works.
   - Explanation: the model is still being loaded.
 - HTTP status code 503
   - Body: `{"error": {"code": 503, "message": "draining", "type": "unavailable_error"}}`
-  - Explanation: the server got SIGTERM with `--drain-propagation` set and is draining.
+  - Explanation: the server got SIGTERM with `--drain-propagation` or `--slot-store` set and is draining.
 - HTTP status code 200
   - Body: `{"status": "ok" }`
   - Explanation: the model is successfully loaded and the server is ready.
@@ -502,6 +505,8 @@ For readiness and liveness probes. Like `/health`, they are public (no API key c
 `/health/ready` returns 200 `{"status": "ok"}`, or 503 `{"status": "unavailable", "reason": "..."}` where `reason` is `loading` or `stalled` (a slot is busy and no progress was made for `--stall-ready` seconds). It stays 200 during a drain: Kubernetes already removes a terminating pod from routing, and the pod must stay "serving" so that its slots can still be saved. `/health/live` returns 503 with `reason` `stalled` only after `--stall-live` seconds without progress, else 200. Progress is each prompt batch and each generation step sent to decode, and each encoded image chunk.
 
 **Graceful drain:** with `--drain-propagation N`, the first SIGTERM makes `/health` return 503 (for generic load balancers). The server keeps accepting requests for N seconds, then answers new POST requests (except `/slots/...`) with 503 `draining`, and exits when no request is in flight. Requests to `/health`, `/health/ready`, `/health/live` and `/metrics` do not count as in flight. A second SIGTERM or SIGINT exits at once (exit code 1).
+
+With `--slot-store`, SIGTERM always starts a drain (N can be 0), slot store requests are still accepted, and the server also waits for the router: it exits when no request is in flight and either the router set the drained flag (`POST /slot-store/drained`), or the router is lost (no slot store request for `--router-lost` seconds, or never) and the server was idle for `--drain-idle-exit` seconds.
 
 ### POST `/completion`: Given a `prompt`, it returns the predicted completion.
 
@@ -1218,6 +1223,26 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
     "n_erased": 1745
 }
 ```
+
+### Slot store: slot files on a shared directory
+
+With `--slot-store DIR --slot-fingerprint FP`, slots are saved to and restored from `DIR/FP/`, and `DIR` can be shared by many servers (for example a soft-mounted NFS volume). Both flags are needed, and they cannot be used with `--slot-save-path`. `DIR` and `DIR/FP` are created at start with mode 0770 when missing; the parent of `DIR` must exist.
+
+- The save `filename` must be `<key>.slot`, where the key (and the fingerprint) is 1 to 128 characters of `[A-Za-z0-9_-]`. A save writes `DIR/FP/.<key>.<random>.tmp`, calls fsync and renames it to `<key>.slot`, so readers never see a partial file. If the rename reports an error but `<key>.slot` exists and the temporary file is gone (a retried rename over NFS), the save succeeded.
+- Every minute, `*.tmp` files older than one hour under `DIR/*/` are removed.
+- The endpoints below need the API key like `/slots`. They are answered on the HTTP threads with file system calls, never by the inference loop. Every slot store request except `GET /slot-store/drained` counts as router contact for the drain, see **Graceful drain**.
+
+`GET /slot-store/info`: `{"fingerprint": FP, "instance": NAME}`, where NAME is `--slot-instance`. It does not touch the disk; a router can use it as its heartbeat.
+
+`GET /slot-store`: the slot files of every fingerprint under `DIR`. `mtime` is in unix seconds. Files that vanish during the listing are skipped; other I/O errors give 500.
+
+```json
+{"fingerprint": "fp1", "files": [{"fingerprint": "fp1", "key": "k1", "size": 14309796, "mtime": 1792000000}]}
+```
+
+`POST /slot-store/evict` with `{"files": [{"fingerprint": "fp1", "key": "k1"}]}`: removes those files and returns `{"removed": N}`. Missing files are not counted. An invalid entry gives 400 and nothing is removed; I/O errors give 500 after all files were tried.
+
+`POST /slot-store/drained`: sets the drained flag. `GET /slot-store/drained`: `{"drained": false, "router_seen_seconds": 12}`, where `router_seen_seconds` is the time since the last router contact, or -1 if none.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

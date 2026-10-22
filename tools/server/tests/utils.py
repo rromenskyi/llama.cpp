@@ -116,6 +116,11 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     drain_propagation: int | None = None
+    drain_idle_exit: int | None = None
+    router_lost: int | None = None
+    slot_store: str | None = None
+    slot_fingerprint: str | None = None
+    slot_instance: str | None = None
     stall_ready: int | None = None
     stall_live: int | None = None
     cache_ram: int | None = None
@@ -293,6 +298,16 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.drain_propagation is not None:
             server_args.extend(["--drain-propagation", self.drain_propagation])
+        if self.drain_idle_exit is not None:
+            server_args.extend(["--drain-idle-exit", self.drain_idle_exit])
+        if self.router_lost is not None:
+            server_args.extend(["--router-lost", self.router_lost])
+        if self.slot_store is not None:
+            server_args.extend(["--slot-store", self.slot_store])
+        if self.slot_fingerprint is not None:
+            server_args.extend(["--slot-fingerprint", self.slot_fingerprint])
+        if self.slot_instance is not None:
+            server_args.extend(["--slot-instance", self.slot_instance])
         if self.stall_ready is not None:
             server_args.extend(["--stall-ready", self.stall_ready])
         if self.stall_live is not None:

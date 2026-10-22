@@ -899,6 +899,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    if (params.slot_store.empty() != params.slot_fingerprint.empty()) {
+        throw std::invalid_argument("error: --slot-store and --slot-fingerprint must be used together\n");
+    }
+    if (!params.slot_store.empty() && !params.slot_save_path.empty()) {
+        throw std::invalid_argument("error: --slot-store cannot be used with --slot-save-path\n");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -3645,6 +3652,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
+    add_opt(common_arg(
+        {"--slot-store"}, "PATH",
+        "shared directory for slot files, needs --slot-fingerprint; slots are saved atomically to PATH/FP/ (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.slot_store = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_STORE"));
+    add_opt(common_arg(
+        {"--slot-fingerprint"}, "FP",
+        "slot store subdirectory for this server, must change when saved slots are no longer valid",
+        [](common_params & params, const std::string & value) {
+            params.slot_fingerprint = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_FINGERPRINT"));
+    add_opt(common_arg(
+        {"--slot-instance"}, "NAME",
+        "name of this server returned by GET /slot-store/info, e.g. the pod name (default: empty)",
+        [](common_params & params, const std::string & value) {
+            params.slot_instance = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_INSTANCE"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",

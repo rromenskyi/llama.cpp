@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-slot-store.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -3035,24 +3036,44 @@ private:
                         break;
                     }
 
+                    // with --slot-store, write a temporary file and rename it once it is complete
+                    const bool use_tmp = !params_base.slot_store.empty();
+                    const std::string filepath_write = use_tmp ? slot_store_tmp_path(filepath) : filepath;
+                    auto remove_tmp = [&]() {
+                        if (use_tmp) {
+                            std::error_code ec;
+                            std::filesystem::remove(std::filesystem::u8path(filepath_write), ec);
+                        }
+                    };
+
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
                     const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
+                        ctx_tgt, filepath_write.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
+                        remove_tmp();
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
 
                     size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                    if (!save_slot_checkpoints(filepath_write, *slot, nwrite_ckpt)) {
+                        remove_tmp();
                         send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
                         break;
                     }
 
                     size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
+                    if (!save_slot_draft(filepath_write, *slot, nwrite_dft)) {
+                        remove_tmp();
                         send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    std::string err_commit;
+                    if (use_tmp && !slot_store_commit(filepath_write, filepath, err_commit)) {
+                        SLT_WRN(*slot, "unable to save slot to '%s': %s\n", filepath.c_str(), err_commit.c_str());
+                        send_error(task, "Unable to save slot: " + err_commit, ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -6071,7 +6092,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     auto res = create_response();
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
-    if (!fs_validate_filename(filename)) {
+    if (!fs_validate_filename(filename) || (!params.slot_store.empty() && !slot_store_valid_filename(filename))) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -6107,7 +6128,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     auto res = create_response();
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
-    if (!fs_validate_filename(filename)) {
+    if (!fs_validate_filename(filename) || (!params.slot_store.empty() && !slot_store_valid_filename(filename))) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }

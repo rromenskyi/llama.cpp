@@ -136,15 +136,28 @@ bool slot_store_read(const std::string & path, int64_t max_bytes, std::vector<ui
     data.resize((size_t) st.st_size);
     errno = 0;
     const size_t n = fread(data.data(), 1, data.size(), f);
+    // EOF right after the expected size; ferror below tells a read error of this probe from the end of the file
+    const bool at_end = n == data.size() && fgetc(f) == EOF;
     const int errno_read = errno;
     const bool failed = ferror(f) != 0;
-    const bool grew = !failed && n == data.size() && fgetc(f) != EOF;
+#ifdef _WIN32
+    struct _stat64 st_end;
+    const int rc_stat_end = _fstat64(_fileno(f), &st_end);
+#else
+    struct stat st_end;
+    const int rc_stat_end = fstat(fileno(f), &st_end);
+#endif
+    const int errno_stat_end = errno;
     fclose(f);
     if (failed) {
         err = std::string("read: ") + strerror(errno_read ? errno_read : EIO);
         return false;
     }
-    if (n != data.size() || grew) {
+    if (rc_stat_end != 0) {
+        err = std::string("stat: ") + strerror(errno_stat_end);
+        return false;
+    }
+    if (!at_end || st_end.st_size != st.st_size) {
         err = "the file changed size during the read";
         return false;
     }

@@ -7,5 +7,6 @@ add_subdirectory(stb)
 
 # only used by common
 if (LLAMA_BUILD_COMMON)
+    add_subdirectory(blake3)
     add_subdirectory(cpp-httplib)
 endif()

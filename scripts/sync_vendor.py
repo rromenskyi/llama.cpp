@@ -13,6 +13,8 @@ SHA1_COMMIT        = "e1e2536fcf6a8f9703be8c85d58724b408552287"
 SHA256_COMMIT      = "5e637272c13f200872d55ff579f7e2ab6c3f252f"
 ROTATE_BITS_COMMIT = "27e784942f67db44abf2115c6638e735b579acd1"
 
+BLAKE3_VERSION = "refs/tags/1.8.7"
+
 vendor = {
     "https://github.com/nlohmann/json/releases/latest/download/json.hpp":     "vendor/nlohmann/json.hpp",
     "https://github.com/nlohmann/json/releases/latest/download/json_fwd.hpp": "vendor/nlohmann/json_fwd.hpp",
@@ -43,6 +45,19 @@ vendor = {
 
     f"https://raw.githubusercontent.com/jb55/rotate-bits.h/{ROTATE_BITS_COMMIT}/rotate-bits.h": "vendor/hash/rotate-bits/rotate-bits.h",
     f"https://raw.githubusercontent.com/jb55/rotate-bits.h/{ROTATE_BITS_COMMIT}/LICENSE.md":   "vendor/hash/rotate-bits/LICENSE.md",
+
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3.c": "vendor/blake3/blake3.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3.h": "vendor/blake3/blake3.h",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_impl.h": "vendor/blake3/blake3_impl.h",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_dispatch.c": "vendor/blake3/blake3_dispatch.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_portable.c": "vendor/blake3/blake3_portable.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_sse2.c": "vendor/blake3/blake3_sse2.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_sse41.c": "vendor/blake3/blake3_sse41.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_avx2.c": "vendor/blake3/blake3_avx2.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_avx512.c": "vendor/blake3/blake3_avx512.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/c/blake3_neon.c": "vendor/blake3/blake3_neon.c",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/LICENSE_CC0": "vendor/blake3/LICENSE_CC0",
+    f"https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/{BLAKE3_VERSION}/LICENSE_A2":  "vendor/blake3/LICENSE_A2",
 }
 
 # local changes kept on top of the upstream sources

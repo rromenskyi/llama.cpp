@@ -571,24 +571,29 @@ def save_in_thread(id_slot: int, filename: str, results: list, timeout: float | 
 SWA_BASE = "The quick brown fox jumps over the lazy dog. " * 20
 
 
+def use_swa_draft_server():
+    # a SWA model with a draft model: the file also holds the context checkpoint and the draft state appendices
+    global server
+    store = server.slot_store
+    server = ServerPreset.tinygemma3()
+    server.temperature = 0.0
+    server.cache_ram = 0
+    server.n_ubatch = 32
+    server.model_draft_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
+    server.spec_type = "draft-simple"
+    server.slot_store = store
+    server.slot_fingerprint = FP
+    server.router_lost = 0
+    server.drain_idle_exit = 0
+
+
 @pytest.mark.parametrize("appendix", [False, True])
 def test_async_save_matches_sync_save(monkeypatch, tmp_path, appendix):
     # two slow saves fill the writer, the third one is written synchronously from the same slot content
     global server
     monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_WRITE_DELAY_MS", "2000")
     if appendix:
-        # a SWA model with a draft model: the file also holds the context checkpoint and the draft state appendices
-        store = server.slot_store
-        server = ServerPreset.tinygemma3()
-        server.temperature = 0.0
-        server.cache_ram = 0
-        server.n_ubatch = 32
-        server.model_draft_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
-        server.spec_type = "draft-simple"
-        server.slot_store = store
-        server.slot_fingerprint = FP
-        server.router_lost = 0
-        server.drain_idle_exit = 0
+        use_swa_draft_server()
         prompt = SWA_BASE + "The first ending of this story is a happy one."
     else:
         prompt = "What is the capital of France?"
@@ -602,10 +607,12 @@ def test_async_save_matches_sync_save(monkeypatch, tmp_path, appendix):
     time.sleep(0.3)
     threads.append(save_in_thread(1, "a2.slot", results))
     time.sleep(0.3)
+    t_sync = time.time()
     res = save(1, "s1.slot")
     assert res.status_code == 200
-    # the synchronous save did not wait for the writer
-    assert sorted(os.listdir(store_path(FP))) == ["s1.slot"]
+    # the synchronous save is committed after the pending ones
+    assert time.time() - t_sync >= 3
+    assert sorted(os.listdir(store_path(FP))) == ["a1.slot", "a2.slot", "s1.slot"]
     for t in threads:
         t.join()
     assert sorted((r[0], r[1]) for r in results) == [("a1.slot", 200), ("a2.slot", 200)]
@@ -629,6 +636,7 @@ def test_async_save_matches_sync_save(monkeypatch, tmp_path, appendix):
     with open(server.log_path) as f:
         log = f.read()
     assert "2 slot saves pending, saving synchronously" in log
+    assert "waiting for 2 pending slot save(s) before a synchronous save" in log
     assert len(re.findall(r"saved to '.*a[12]\.slot': snapshot [0-9.]+ s, write [0-9.]+ s, [0-9.]+ MiB", log)) == 2
 
     # the async file restores
@@ -640,6 +648,64 @@ def test_async_save_matches_sync_save(monkeypatch, tmp_path, appendix):
     assert res.body["n_read"] == len(files["a1.slot"])
     if not appendix:
         assert prompt_n_germany(0) == 6
+
+
+def test_sync_save_is_committed_after_pending_saves(monkeypatch):
+    # two slow saves of k1 fill the writer, then the slot changes and a third save of k1 goes synchronously:
+    # the file left is the last save, not an older snapshot renamed over it
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_WRITE_DELAY_MS", "1500")
+    server.start()
+    fill_slot(1)
+    results = []
+    threads = [save_in_thread(1, "k1.slot", results)]
+    time.sleep(0.3)
+    threads.append(save_in_thread(1, "k1.slot", results))
+    time.sleep(0.3)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Once upon a time",
+        "id_slot": 1,
+        "cache_prompt": True,
+        "n_predict": 8,
+    })
+    assert res.status_code == 200
+    res = save(1, "k1.slot")
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    for t in threads:
+        t.join()
+    assert [r[1] for r in results] == [200, 200]
+    assert all(r[2]["n_saved"] == 84 for r in results)
+    assert n_saved != 84
+
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    assert os.path.getsize(store_path(FP, "k1.slot")) == res.body["n_written"]
+    res = restore(0, "k1.slot")
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+
+def test_snapshot_appendix_failure_fails_the_save(monkeypatch):
+    # the appendix cannot be written to the snapshot: the save fails, no partial file is published
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_SNAPSHOT_FAIL", "1")
+    use_swa_draft_server()
+    write_file(store_path(FP, "k1.slot"), data=b"previous")
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": SWA_BASE + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    res = save(1, "k1.slot")
+    assert res.status_code == 500
+    assert "incomplete context checkpoints or draft state" in res.body["error"]["message"]
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    assert open(store_path(FP, "k1.slot"), "rb").read() == b"previous"
+    # the server keeps working
+    assert server.make_request("GET", "/health").status_code == 200
 
 
 def test_slow_save_does_not_block_other_slots(monkeypatch):

@@ -946,12 +946,17 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 //
 
 // appends to a vector, lets the slot file appendices be written to memory
+// note: std::ostream turns an exception thrown here (bad_alloc) into badbit, the caller must check the stream
 struct vector_streambuf : std::streambuf {
     std::vector<uint8_t> & buf;
+    const bool test_fail; // test hook: every write fails like a failed allocation
 
-    explicit vector_streambuf(std::vector<uint8_t> & buf) : buf(buf) {}
+    vector_streambuf(std::vector<uint8_t> & buf, bool test_fail) : buf(buf), test_fail(test_fail) {}
 
     std::streamsize xsputn(const char * s, std::streamsize n) override {
+        if (test_fail) {
+            throw std::bad_alloc();
+        }
         buf.insert(buf.end(), (const uint8_t *) s, (const uint8_t *) s + n);
         return n;
     }
@@ -999,11 +1004,20 @@ struct server_slot_writer {
         std::lock_guard<std::mutex> lock(mutex);
         if (!thread.joinable()) {
             stop = false;
-            thread = std::thread([this]() { run(); });
+            thread = std::thread([this]() { run(); }); // can throw std::system_error
         }
-        jobs.push_back(std::move(j));
+        jobs.push_back(std::move(j)); // can throw std::bad_alloc, then nothing was queued
         n_jobs++;
         cv.notify_all();
+    }
+
+    // waits until every pending snapshot is written, so that a synchronous save is committed after them
+    void wait_idle() {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (n_jobs > 0) {
+            SRV_INF("waiting for %d pending slot save(s) before a synchronous save\n", n_jobs);
+        }
+        cv_idle.wait(lock, [this] { return n_jobs == 0; });
     }
 
     // writes every pending snapshot and stops the thread, a later push starts it again
@@ -1027,6 +1041,7 @@ private:
 
     std::mutex              mutex;
     std::condition_variable cv;
+    std::condition_variable cv_idle;
     std::deque<job>         jobs;
     int                     n_jobs = 0; // queued or being written
     bool                    stop   = false;
@@ -1042,9 +1057,23 @@ private:
             job j = std::move(jobs.front());
             jobs.pop_front();
             lock.unlock();
-            write(j);
+            try {
+                write(j);
+            } catch (const std::exception & e) {
+                // the request must not stay unanswered
+                SRV_ERR("slot %d: unable to save slot to '%s': %s\n", j.id_slot, j.filepath.c_str(), e.what());
+                try {
+                    auto res = std::make_unique<server_task_result_error>();
+                    res->id       = j.id_task;
+                    res->err_type = ERROR_TYPE_SERVER;
+                    res->err_msg  = std::string("Unable to save slot: ") + e.what();
+                    queue_results.send(std::move(res));
+                } catch (const std::exception &) {
+                }
+            }
             lock.lock();
             n_jobs--;
+            cv_idle.notify_all();
         }
     }
 
@@ -3068,10 +3097,12 @@ private:
     }
 
     // with --slot-store: takes a snapshot of the slot file in memory and lets slot_writer write it, the slot is free again at once
-    // returns false to save synchronously instead: MAX_PENDING snapshots are pending already, or there is no memory for one
+    // returns false to save synchronously instead: MAX_PENDING snapshots are pending already, or the snapshot could not be queued
     bool save_slot_async(const server_task & task, const server_slot & slot, const std::vector<char> & packed, int64_t t_start) {
         // test hook: always save synchronously
         static const bool test_sync = getenv("LLAMA_SERVER_TEST_SLOT_SAVE_SYNC") != nullptr;
+        // test hook: the appendix of the snapshot cannot be written, like a failed allocation
+        static const bool test_appendix_fail = getenv("LLAMA_SERVER_TEST_SLOT_SNAPSHOT_FAIL") != nullptr;
         if (test_sync) {
             return false;
         }
@@ -3084,58 +3115,71 @@ private:
         const llama_token * tokens   = reinterpret_cast<const llama_token *>(packed.data());
         const size_t        n_tokens = packed.size() / sizeof(llama_token);
 
-        // the appendices follow the llama state, as in the file
-        std::vector<uint8_t> appendix;
-        {
-            vector_streambuf sb(appendix);
-            std::ostream os(&sb);
-            size_t n_written = 0;
-            if (!slot.prompt.checkpoints.empty()) {
-                write_slot_checkpoints(os, slot, n_written);
+        // nothing is sent before the job is queued, so that a failure can still fall back to the synchronous save
+        try {
+            // the appendices follow the llama state, as in the file
+            std::vector<uint8_t> appendix;
+            bool appendix_ok = true;
+            {
+                vector_streambuf sb(appendix, test_appendix_fail);
+                std::ostream os(&sb);
+                size_t n_written = 0;
+                if (!slot.prompt.checkpoints.empty()) {
+                    write_slot_checkpoints(os, slot, n_written);
+                }
+                std::vector<uint8_t> data_dft;
+                std::vector<uint8_t> data_spec;
+                get_slot_draft(slot, data_dft, data_spec);
+                if (!data_dft.empty() || !data_spec.empty()) {
+                    write_slot_draft(os, data_dft, data_spec, n_written);
+                }
+                appendix_ok = (bool) os;
             }
-            std::vector<uint8_t> data_dft;
-            std::vector<uint8_t> data_spec;
-            get_slot_draft(slot, data_dft, data_spec);
-            if (!data_dft.empty() || !data_spec.empty()) {
-                write_slot_draft(os, data_dft, data_spec, n_written);
+            if (!appendix_ok) {
+                send_error(task, "Unable to save slot: incomplete context checkpoints or draft state", ERROR_TYPE_SERVER);
+                return true;
             }
-        }
 
-        const size_t n_state = llama_state_seq_save_buffer(ctx_tgt, nullptr, 0, slot.id, tokens, n_tokens);
-        if (n_state == 0) {
-            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-            return true;
-        }
-        const size_t n_bytes = n_state + appendix.size();
-        if ((uint64_t) (n_bytes + SLOT_STORE_TRAILER_SIZE) > (uint64_t) params_base.slot_max_bytes) {
-            send_error(task, slot_too_large(n_bytes + SLOT_STORE_TRAILER_SIZE, params_base.slot_max_bytes), ERROR_TYPE_SERVER);
-            return true;
-        }
+            const size_t n_state = llama_state_seq_save_buffer(ctx_tgt, nullptr, 0, slot.id, tokens, n_tokens);
+            if (n_state == 0) {
+                send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                return true;
+            }
+            const size_t n_bytes = n_state + appendix.size();
+            if ((uint64_t) (n_bytes + SLOT_STORE_TRAILER_SIZE) > (uint64_t) params_base.slot_max_bytes) {
+                send_error(task, slot_too_large(n_bytes + SLOT_STORE_TRAILER_SIZE, params_base.slot_max_bytes), ERROR_TYPE_SERVER);
+                return true;
+            }
 
-        std::unique_ptr<uint8_t[]> data(new (std::nothrow) uint8_t[n_bytes]);
-        if (!data) {
-            SLT_WRN(slot, "cannot allocate %.1f MiB for a slot snapshot, saving synchronously\n", n_bytes / 1024.0 / 1024.0);
+            std::unique_ptr<uint8_t[]> data(new (std::nothrow) uint8_t[n_bytes]);
+            if (!data) {
+                SLT_WRN(slot, "cannot allocate %.1f MiB for a slot snapshot, saving synchronously\n", n_bytes / 1024.0 / 1024.0);
+                return false;
+            }
+            if (llama_state_seq_save_buffer(ctx_tgt, data.get(), n_state, slot.id, tokens, n_tokens) != n_state) {
+                send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                return true;
+            }
+            if (!appendix.empty()) {
+                memcpy(data.get() + n_state, appendix.data(), appendix.size());
+            }
+
+            server_slot_writer::job j;
+            j.id_task       = task.id;
+            j.id_slot       = slot.id;
+            j.filename      = task.slot_action.filename;
+            j.filepath      = task.slot_action.filepath;
+            j.n_tokens      = slot.prompt.tokens.size();
+            j.data          = std::move(data);
+            j.size          = n_bytes;
+            j.t_start_us    = t_start;
+            j.t_snapshot_us = ggml_time_us();
+            slot_writer.push(std::move(j));
+        } catch (const std::exception & e) {
+            // bad_alloc, or std::system_error when the writer thread cannot start
+            SLT_WRN(slot, "cannot queue the slot snapshot (%s), saving synchronously\n", e.what());
             return false;
         }
-        if (llama_state_seq_save_buffer(ctx_tgt, data.get(), n_state, slot.id, tokens, n_tokens) != n_state) {
-            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-            return true;
-        }
-        if (!appendix.empty()) {
-            memcpy(data.get() + n_state, appendix.data(), appendix.size());
-        }
-
-        server_slot_writer::job j;
-        j.id_task       = task.id;
-        j.id_slot       = slot.id;
-        j.filename      = task.slot_action.filename;
-        j.filepath      = task.slot_action.filepath;
-        j.n_tokens      = slot.prompt.tokens.size();
-        j.data          = std::move(data);
-        j.size          = n_bytes;
-        j.t_start_us    = t_start;
-        j.t_snapshot_us = ggml_time_us();
-        slot_writer.push(std::move(j));
         return true;
     }
 
@@ -3346,6 +3390,10 @@ private:
 
                     // with --slot-store, write a temporary file and rename it once it is complete
                     const bool use_tmp = !params_base.slot_store.empty();
+                    if (use_tmp) {
+                        // commit after the pending snapshots, an older snapshot of the same file must not replace this one
+                        slot_writer.wait_idle();
+                    }
                     const std::string filepath_write = use_tmp ? slot_store_tmp_path(filepath) : filepath;
                     auto remove_tmp = [&]() {
                         if (use_tmp) {

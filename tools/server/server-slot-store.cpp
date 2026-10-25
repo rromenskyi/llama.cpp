@@ -3,6 +3,8 @@
 
 #include "ggml.h"
 
+#include "blake3/blake3.h"
+
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
@@ -50,6 +52,113 @@ std::string slot_store_tmp_path(const std::string & path) {
     return (p.parent_path() / ("." + p.stem().string() + "." + rnd + ".tmp")).string();
 }
 
+static const char SLOT_TRAILER_MAGIC[8] = {'B', '3', 'S', 'L', 'O', 'T', '0', '1'};
+
+static void blake3_of(const uint8_t * data, size_t size, uint8_t * out) {
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(&hasher, data, size);
+    blake3_hasher_finalize(&hasher, out, BLAKE3_OUT_LEN);
+}
+
+// appends the trailer to the file at path
+static bool append_trailer(const std::string & path, std::string & err) {
+    FILE * f = ggml_fopen(path.c_str(), "rb");
+    if (!f) {
+        err = std::string("open: ") + strerror(errno);
+        return false;
+    }
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    std::vector<uint8_t> buf(1 << 20);
+    size_t n;
+    errno = 0;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        blake3_hasher_update(&hasher, buf.data(), n);
+    }
+    const bool failed = ferror(f) != 0;
+    const int errno_read = errno;
+    fclose(f);
+    if (failed) {
+        err = std::string("read: ") + strerror(errno_read ? errno_read : EIO);
+        return false;
+    }
+    uint8_t digest[BLAKE3_OUT_LEN];
+    blake3_hasher_finalize(&hasher, digest, sizeof(digest));
+
+    f = ggml_fopen(path.c_str(), "ab");
+    if (!f) {
+        err = std::string("open: ") + strerror(errno);
+        return false;
+    }
+    bool ok = fwrite(SLOT_TRAILER_MAGIC, 1, sizeof(SLOT_TRAILER_MAGIC), f) == sizeof(SLOT_TRAILER_MAGIC) &&
+              fwrite(digest, 1, sizeof(digest), f) == sizeof(digest);
+    int errno_write = errno;
+    if (fclose(f) != 0 && ok) {
+        ok = false;
+        errno_write = errno;
+    }
+    if (!ok) {
+        err = std::string("write: ") + strerror(errno_write);
+    }
+    return ok;
+}
+
+bool slot_store_read(const std::string & path, bool checked, std::vector<uint8_t> & data, std::string & err) {
+    // test hook: overwrites the file once it was read, like another server replacing it during a restore
+    static const bool test_replace = getenv("LLAMA_SERVER_TEST_RESTORE_REPLACE") != nullptr;
+
+    data.clear();
+    FILE * f = ggml_fopen(path.c_str(), "rb");
+    if (!f) {
+        err = std::string("open: ") + strerror(errno);
+        return false;
+    }
+    std::error_code ec;
+    const uintmax_t size_hint = fs::file_size(fs::u8path(path), ec);
+    if (!ec) {
+        data.reserve(size_hint);
+    }
+    std::vector<uint8_t> buf(1 << 20);
+    size_t n;
+    errno = 0;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        data.insert(data.end(), buf.begin(), buf.begin() + n);
+    }
+    const bool failed = ferror(f) != 0;
+    const int errno_read = errno;
+    fclose(f);
+    if (failed) {
+        err = std::string("read: ") + strerror(errno_read ? errno_read : EIO);
+        return false;
+    }
+    if (checked && test_replace) {
+        FILE * fr = ggml_fopen(path.c_str(), "wb");
+        if (fr) {
+            fputs("replaced", fr);
+            fclose(fr);
+        }
+    }
+    if (!checked) {
+        return true;
+    }
+
+    if (data.size() < SLOT_STORE_TRAILER_SIZE ||
+        memcmp(data.data() + data.size() - SLOT_STORE_TRAILER_SIZE, SLOT_TRAILER_MAGIC, sizeof(SLOT_TRAILER_MAGIC)) != 0) {
+        err = "no checksum trailer";
+        return false;
+    }
+    const size_t n_payload = data.size() - SLOT_STORE_TRAILER_SIZE;
+    uint8_t digest[BLAKE3_OUT_LEN];
+    blake3_of(data.data(), n_payload, digest);
+    if (memcmp(data.data() + n_payload + sizeof(SLOT_TRAILER_MAGIC), digest, sizeof(digest)) != 0) {
+        err = "checksum mismatch";
+        return false;
+    }
+    data.resize(n_payload);
+    return true;
+}
+
 // random id generated once per server process, lets a router notice a restart
 static const std::string & slot_store_boot_id() {
     static const std::string id = [] {
@@ -82,6 +191,13 @@ bool slot_store_commit(const std::string & tmp, const std::string & path, uint64
         std::error_code ec;
         fs::resize_file(fs::u8path(tmp), n_bytes - 1, ec);
     }
+
+    // the hash is in the one file that the rename publishes, so the two cannot get out of step
+    std::string err_trailer;
+    if (!append_trailer(tmp, err_trailer)) {
+        return fail("trailer: " + err_trailer);
+    }
+    n_bytes += SLOT_STORE_TRAILER_SIZE;
 
 #ifndef _WIN32
     const int fd = open(tmp.c_str(), O_WRONLY | O_CLOEXEC);

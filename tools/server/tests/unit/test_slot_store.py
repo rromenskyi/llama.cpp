@@ -386,3 +386,126 @@ def test_short_file_keeps_previous_slot(monkeypatch):
     assert "bytes" in res.body["error"]["message"]
     assert os.listdir(store_path(FP)) == ["k1.slot"]
     assert open(store_path(FP, "k1.slot"), "rb").read() == b"previous"
+
+
+TRAILER = 40
+
+
+def restore(id_slot: int, filename: str, s: ServerProcess | None = None):
+    s = s or server
+    return s.make_request("POST", f"/slots/{id_slot}?action=restore", data={"filename": filename})
+
+
+def prompt_n_germany(id_slot: int) -> int:
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?",
+        "id_slot": id_slot,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    return res.body["timings"]["prompt_n"]
+
+
+def test_save_writes_trailer():
+    global server
+    server.start()
+    fill_slot(1)
+    res = save(1, "k1.slot")
+    assert res.status_code == 200
+    path = store_path(FP, "k1.slot")
+    data = open(path, "rb").read()
+    assert data[-TRAILER:-32] == b"B3SLOT01"
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    # the sizes include the trailer
+    assert res.body["n_written"] == len(data)
+    res = server.make_request("GET", "/slot-store")
+    assert [(f["key"], f["size"]) for f in res.body["files"]] == [("k1", len(data))]
+
+
+@pytest.mark.parametrize("damage", ["flip", "flip_trailer", "no_trailer"])
+def test_restore_damaged_fails(damage):
+    global server
+    server.start()
+    fill_slot(1)
+    assert save(1, "k1.slot").status_code == 200
+    path = store_path(FP, "k1.slot")
+    data = bytearray(open(path, "rb").read())
+    if damage == "flip":
+        data[len(data) // 2] ^= 0xff
+    elif damage == "flip_trailer":
+        data[-1] ^= 0xff
+    else:
+        data = data[:-TRAILER]
+    with open(path, "wb") as f:
+        f.write(data)
+
+    # slot 0 holds the shared prefix before the restore
+    fill_slot(0)
+    res = restore(0, "k1.slot")
+    assert res.status_code == 400
+    msg = res.body["error"]["message"]
+    assert ("no checksum trailer" if damage == "no_trailer" else "checksum mismatch") in msg
+    # the failed restore leaves the slot empty: the whole prompt is processed
+    assert prompt_n_germany(0) > 6
+
+    # a good file restores again
+    assert save(1, "k1.slot").status_code == 200
+    assert restore(0, "k1.slot").status_code == 200
+    assert prompt_n_germany(0) == 6
+
+
+def test_restore_uses_the_bytes_it_checked(monkeypatch):
+    # the file is overwritten right after it was read: the restore must not open it again
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_TEST_RESTORE_REPLACE", "1")
+    server.start()
+    fill_slot(1)
+    res = save(1, "k1.slot")
+    assert res.status_code == 200
+    n_written = res.body["n_written"]
+    res = restore(0, "k1.slot")
+    assert res.status_code == 200
+    assert res.body["n_restored"] == 84
+    assert res.body["n_read"] == n_written
+    assert open(store_path(FP, "k1.slot"), "rb").read() == b"replaced"
+    assert prompt_n_germany(0) == 6
+
+
+def test_concurrent_saves_of_one_key():
+    global server
+    other = ServerPreset.tinyllama2()
+    other.temperature = 0.0
+    other.slot_store = server.slot_store
+    other.slot_fingerprint = FP
+    other.router_lost = 0
+    other.drain_idle_exit = 0
+    other.server_port = server.server_port + 1
+    server.start()
+    other.start()
+    errors = []
+
+    def run(s: ServerProcess):
+        try:
+            res = s.make_request("POST", "/completion", data={
+                "prompt": "What is the capital of France?",
+                "id_slot": 1,
+                "cache_prompt": True,
+            })
+            assert res.status_code == 200
+            for _ in range(10):
+                res = s.make_request("POST", "/slots/1?action=save", data={"filename": "k1.slot"})
+                assert res.status_code == 200
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(s,)) for s in (server, other)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    for s in (server, other):
+        res = restore(0, "k1.slot", s)
+        assert res.status_code == 200
+        assert res.body["n_restored"] == 84

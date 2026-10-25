@@ -2630,7 +2630,15 @@ private:
     static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
     static constexpr uint32_t SLOT_CKPT_VERSION = 1;
 
-    static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
+    // a read-only stream over a slot file read into memory
+    struct slot_membuf : std::streambuf {
+        slot_membuf(const std::vector<uint8_t> & data, size_t offset) {
+            char * p = const_cast<char *>(reinterpret_cast<const char *>(data.data()));
+            setg(p + offset, p + offset, p + data.size());
+        }
+    };
+
+    static bool ckpt_read(std::istream & ifs, void * dst, size_t size, size_t & n_read) {
         if (!ifs.read((char *) dst, size)) {
             return false;
         }
@@ -2638,7 +2646,7 @@ private:
         return true;
     }
 
-    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
+    static bool ckpt_read_buf(std::istream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
         uint64_t n = 0;
         // check the size against the bytes left in the file before allocating, the size field may be corrupted
         if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
@@ -2697,13 +2705,13 @@ private:
     }
 
     // returns the number of bytes consumed, 0 if there is no usable appendix
-    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
-        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
-        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
-        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
+    size_t load_slot_checkpoints(const std::string & filepath, const std::vector<uint8_t> & data, size_t offset, server_slot & slot) const {
+        if (data.size() < offset) {
             return 0;
         }
-        const size_t n_avail = file_size - offset; // bytes after the llama state payload
+        slot_membuf mb(data, offset);
+        std::istream ifs(&mb);
+        const size_t n_avail = data.size() - offset; // bytes after the llama state payload
         size_t n_read = 0;
         uint32_t magic   = 0;
         uint32_t version = 0;
@@ -2795,16 +2803,16 @@ private:
 
     // returns the number of bytes consumed, 0 if there is no usable draft state
     // the draft starts empty unless the file holds a draft state that fits the draft context
-    size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
+    size_t load_slot_draft(const std::string & filepath, const std::vector<uint8_t> & data, size_t offset, server_slot & slot) const {
         if (ctx_dft != nullptr) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
         }
-        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
-        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
-        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
+        if (data.size() < offset) {
             return 0;
         }
-        const size_t n_avail = file_size - offset;
+        slot_membuf mb(data, offset);
+        std::istream ifs(&mb);
+        const size_t n_avail = data.size() - offset;
         size_t n_read = 0;
         uint32_t magic   = 0;
         uint32_t version = 0;
@@ -3086,7 +3094,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft + (use_tmp ? SLOT_STORE_TRAILER_SIZE : 0);
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3110,14 +3118,22 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // the file is read with one open, with --slot-store its checksum is verified on exactly the bytes restored
+                    const bool checked = !params_base.slot_store.empty();
+                    std::vector<uint8_t> data;
                     size_t nread = 0;
                     try {
+                        std::string err_read;
+                        if (!slot_store_read(filepath, checked, data, err_read)) {
+                            throw std::runtime_error(err_read);
+                        }
+
                         size_t n_packed = 0;
                         llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                        nread = llama_state_seq_load_buffer(ctx_tgt, data.data(), data.size(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            nread = llama_state_seq_load_buffer(ctx_tgt, data.data(), data.size(), slot->id, packed.data(), packed.size(), &n_packed);
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
@@ -3143,8 +3159,8 @@ private:
                     }
 
                     // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
+                    const size_t nread_ckpt = load_slot_checkpoints(filepath, data, nread, *slot);
+                    const size_t nread_dft  = load_slot_draft(filepath, data, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3155,7 +3171,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->n_bytes  = nread + nread_ckpt + nread_dft + (checked ? SLOT_STORE_TRAILER_SIZE : 0);
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;

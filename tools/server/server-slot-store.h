@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 // slot files on a shared directory, see --slot-store
 // layout: <dir>/<fingerprint>/<key>.slot, the directory can be a soft-mounted NFS volume shared by many servers
@@ -21,8 +22,14 @@ bool slot_store_valid_filename(const std::string & filename);
 // a unique temporary file next to path: .<key>.<random>.tmp
 std::string slot_store_tmp_path(const std::string & path);
 
-// fsync tmp, check that it holds n_bytes, and rename it to path; on failure tmp is removed
+// with --slot-store, a slot file ends with a trailer: "B3SLOT01" and the BLAKE3 hash of all bytes before it
+static constexpr size_t SLOT_STORE_TRAILER_SIZE = 40;
+
+// append the trailer to tmp, fsync it, check that it holds n_bytes and the trailer, and rename it to path; on failure tmp is removed
 bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err);
+
+// read the whole file with one open; with checked, verify the trailer and remove it from data
+bool slot_store_read(const std::string & path, bool checked, std::vector<uint8_t> & data, std::string & err);
 
 struct server_slot_store {
     // creates <dir>/<fingerprint>/ and starts the janitor, throws on error

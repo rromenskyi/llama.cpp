@@ -3585,6 +3585,46 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     return file.tell();
 }
 
+size_t llama_context::state_seq_load_buffer(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    llama_io_read_host io(src, size);
+
+    try {
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        io.read(&magic,   sizeof(magic));
+        io.read(&version, sizeof(version));
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state: %08x, %08x\n", __func__, magic, version);
+            return 0;
+        }
+
+        uint32_t n_token_count = 0;
+        io.read(&n_token_count, sizeof(n_token_count));
+
+        if (tokens_out == nullptr) {
+            const size_t n_token_max = (size - io.n_bytes()) / sizeof(llama_token);
+            if (n_token_count > n_token_max) {
+                LLAMA_LOG_ERROR("%s: token count in sequence state exceeds the size! %u > %zu\n", __func__, n_token_count, n_token_max);
+                return 0;
+            }
+            *n_token_count_out = n_token_count;
+            return io.n_bytes();
+        }
+
+        if (n_token_count > n_token_capacity) {
+            LLAMA_LOG_ERROR("%s: token count in sequence state exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
+            return 0;
+        }
+        io.read(tokens_out, sizeof(llama_token) * n_token_count);
+        *n_token_count_out = n_token_count;
+
+        return state_seq_read_data(io, seq_id, 0);
+    } catch (const std::exception &) {
+        io.discard();
+        throw;
+    }
+}
+
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
@@ -4592,6 +4632,17 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_buffer(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_load_buffer(dest_seq_id, src, size, tokens_out, n_token_capacity, n_token_count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
         return 0;
     }
 }

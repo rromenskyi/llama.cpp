@@ -1233,18 +1233,19 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 With `--slot-store DIR --slot-fingerprint FP`, slots are saved to and restored from `DIR/FP/`, and `DIR` can be shared by many servers (for example a soft-mounted NFS volume). Both flags are needed, and they cannot be used with `--slot-save-path`. `DIR` and `DIR/FP` are created at start with mode 0770 when missing; the parent of `DIR` must exist.
 
 - The save `filename` must be `<key>.slot`, where the key (and the fingerprint) is 1 to 128 characters of `[A-Za-z0-9_-]`. A save writes `DIR/FP/.<key>.<random>.tmp`, calls fsync, checks that its size matches the bytes written, and renames it to `<key>.slot`, so readers never see a partial file. A failed save leaves the previous `<key>.slot` in place. If the rename reports an error but `<key>.slot` exists and the temporary file is gone (a retried rename over NFS), the save succeeded.
-- Every minute, `*.tmp` files older than one hour under `DIR/*/` are removed.
+- Before the rename, the save writes the BLAKE3 hash of the file to `<key>.slot.blake3` (64 hex chars and a newline, written to a temporary file, synced and renamed), so a visible `<key>.slot` always has its hash file. A restore checks the file against it first: a mismatch or a missing or unreadable hash file fails the restore with 400, and the slot is left empty. A save whose final rename fails leaves a hash file that does not match the previous `<key>.slot`, so that file can no longer be restored.
+- Every minute, `*.tmp` files and `*.slot.blake3` files without their `*.slot` file older than one hour under `DIR/*/` are removed.
 - The endpoints below need the API key like `/slots`. They are answered on the HTTP threads with file system calls, never by the inference loop. Every slot store request except `GET /slot-store/drained` counts as router contact for the drain, see **Graceful drain**.
 
 `GET /slot-store/info`: `{"fingerprint": FP, "instance": NAME, "boot_id": ID}`, where NAME is `--slot-instance` and ID is a random 16-hex-char id generated when the server process starts (a changed ID means the process restarted and its slots are gone). It does not touch the disk; a router can use it as its heartbeat.
 
-`GET /slot-store`: the slot files of every fingerprint under `DIR`. `mtime` is in unix seconds. Files that vanish during the listing are skipped; other I/O errors give 500.
+`GET /slot-store`: the slot files of every fingerprint under `DIR`. `size` is the size of `<key>.slot` without its hash file, `mtime` is in unix seconds. Files that vanish during the listing are skipped; other I/O errors give 500.
 
 ```json
 {"fingerprint": "fp1", "files": [{"fingerprint": "fp1", "key": "k1", "size": 14309796, "mtime": 1792000000}]}
 ```
 
-`POST /slot-store/evict` with `{"files": [{"fingerprint": "fp1", "key": "k1"}]}`: removes those files and returns `{"removed": N}`. Missing files are not counted. An invalid entry gives 400 and nothing is removed; I/O errors give 500 after all files were tried.
+`POST /slot-store/evict` with `{"files": [{"fingerprint": "fp1", "key": "k1"}]}`: removes those files, each `<key>.slot` first and then its hash file, and returns `{"removed": N}`, the number of `<key>.slot` files removed. Missing files are not counted. An invalid entry gives 400 and nothing is removed; I/O errors give 500 after all files were tried.
 
 `POST /slot-store/drained`: sets the drained flag. `GET /slot-store/drained`: `{"drained": false, "router_seen_seconds": 12}`, where `router_seen_seconds` is the time since the last router contact, or -1 if none.
 

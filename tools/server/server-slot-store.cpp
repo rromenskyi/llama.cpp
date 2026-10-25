@@ -3,12 +3,15 @@
 
 #include "ggml.h"
 
+#include "blake3/blake3.h"
+
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <vector>
 
@@ -34,7 +37,8 @@ bool slot_store_valid_name(const std::string & name) {
     return true;
 }
 
-static const std::string SLOT_EXT = ".slot";
+static const std::string SLOT_EXT   = ".slot";
+static const std::string BLAKE3_EXT = ".blake3";
 
 bool slot_store_valid_filename(const std::string & filename) {
     return filename.size() > SLOT_EXT.size() &&
@@ -48,6 +52,80 @@ std::string slot_store_tmp_path(const std::string & path) {
     char rnd[17];
     snprintf(rnd, sizeof(rnd), "%016" PRIx64, (uint64_t) rng());
     return (p.parent_path() / ("." + p.stem().string() + "." + rnd + ".tmp")).string();
+}
+
+// returns the BLAKE3 of the file as 64 hex chars, or an empty string with err set
+static std::string blake3_file(const std::string & path, std::string & err) {
+    FILE * f = ggml_fopen(path.c_str(), "rb");
+    if (!f) {
+        err = std::string("open: ") + strerror(errno);
+        return "";
+    }
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    std::vector<uint8_t> buf(1 << 20);
+    size_t n;
+    errno = 0;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        blake3_hasher_update(&hasher, buf.data(), n);
+    }
+    const bool failed = ferror(f) != 0;
+    const int errno_read = errno;
+    fclose(f);
+    if (failed) {
+        err = std::string("read: ") + strerror(errno_read ? errno_read : EIO);
+        return "";
+    }
+    uint8_t digest[BLAKE3_OUT_LEN];
+    blake3_hasher_finalize(&hasher, digest, sizeof(digest));
+    std::string out;
+    for (uint8_t c : digest) {
+        out += string_format("%02x", c);
+    }
+    return out;
+}
+
+// writes "<hash>\n" to path and syncs it
+static bool write_hash(const std::string & path, const std::string & hash, std::string & err) {
+    FILE * f = ggml_fopen(path.c_str(), "wb");
+    if (!f) {
+        err = std::string("open: ") + strerror(errno);
+        return false;
+    }
+    const std::string line = hash + "\n";
+    bool ok = fwrite(line.data(), 1, line.size(), f) == line.size() && fflush(f) == 0;
+#ifndef _WIN32
+    ok = ok && fsync(fileno(f)) == 0;
+#endif
+    int errno_write = errno;
+    if (fclose(f) != 0 && ok) {
+        ok = false;
+        errno_write = errno;
+    }
+    if (!ok) {
+        err = std::string("write: ") + strerror(errno_write);
+    }
+    return ok;
+}
+
+bool slot_store_verify(const std::string & path, std::string & err) {
+    std::ifstream f(fs::u8path(path + BLAKE3_EXT), std::ios::binary);
+    std::string want;
+    if (!f || !std::getline(f, want)) {
+        err = "cannot read the hash file " + path + BLAKE3_EXT;
+        return false;
+    }
+    std::string err_hash;
+    const std::string got = blake3_file(path, err_hash);
+    if (got.empty()) {
+        err = "cannot hash " + path + ": " + err_hash;
+        return false;
+    }
+    if (got != want) {
+        err = "checksum mismatch: " + path + " has blake3 " + got + ", " + path + BLAKE3_EXT + " has " + want.substr(0, 64);
+        return false;
+    }
+    return true;
 }
 
 // random id generated once per server process, lets a router notice a restart
@@ -108,6 +186,27 @@ bool slot_store_commit(const std::string & tmp, const std::string & path, uint64
     }
     if (size != n_bytes) {
         return fail(string_format("the file has %ju bytes, %" PRIu64 " were written", size, n_bytes));
+    }
+
+    // the hash goes in place first, so that a visible slot file always has one; if the rename below fails, an old
+    // slot file is left with a hash that does not match, and its restore fails
+    std::string err_hash;
+    const std::string hash = blake3_file(tmp, err_hash);
+    if (hash.empty()) {
+        return fail("hash: " + err_hash);
+    }
+    const std::string path_hash = path + BLAKE3_EXT;
+    const std::string tmp_hash  = slot_store_tmp_path(path_hash);
+    if (!write_hash(tmp_hash, hash, err_hash)) {
+        std::error_code ec_hash;
+        fs::remove(fs::u8path(tmp_hash), ec_hash);
+        return fail(path_hash + ": " + err_hash);
+    }
+    fs::rename(fs::u8path(tmp_hash), fs::u8path(path_hash), ec);
+    if (ec) {
+        std::error_code ec_hash;
+        fs::remove(fs::u8path(tmp_hash), ec_hash);
+        return fail("rename " + path_hash + ": " + ec.message());
     }
 
     if (test_rename_error != "before") {
@@ -256,13 +355,17 @@ server_slot_store::server_slot_store(const std::string & dir, const std::string 
         int n_removed = 0;
         int n_failed  = 0;
         std::string first_err;
+        // the slot file first, so that a visible slot file always has its hash file
         for (const auto & path : paths) {
-            std::error_code ec;
-            if (fs::remove(path, ec)) {
-                n_removed++;
-            } else if (ec && !is_vanished(ec)) {
-                if (n_failed++ == 0) {
-                    first_err = "cannot remove '" + path.string() + "': " + ec.message();
+            for (const fs::path & p : {path, fs::path(path).concat(BLAKE3_EXT)}) {
+                std::error_code ec;
+                if (fs::remove(p, ec)) {
+                    n_removed += p == path;
+                } else if (ec && !is_vanished(ec)) {
+                    if (n_failed++ == 0) {
+                        first_err = "cannot remove '" + p.string() + "': " + ec.message();
+                    }
+                    break;
                 }
             }
         }
@@ -293,7 +396,7 @@ server_slot_store::server_slot_store(const std::string & dir, const std::string 
         std::unique_lock<std::mutex> lock(janitor_mutex);
         while (!janitor_stop) {
             lock.unlock();
-            remove_old_tmp();
+            remove_leftovers();
             lock.lock();
             janitor_cv.wait_for(lock, std::chrono::seconds(SLOT_STORE_JANITOR_SECONDS), [this] { return janitor_stop; });
         }
@@ -324,14 +427,21 @@ void server_slot_store::router_seen() {
     t_router_seen_ms.store(ggml_time_ms());
 }
 
-// removes <dir>/*/*.tmp older than one hour, left by servers that died during a save
-void server_slot_store::remove_old_tmp() const {
+// removes <dir>/*/*.tmp older than one hour, left by servers that died during a save, and *.slot.blake3 files older
+// than one hour without their slot file, left by a failed save or evict
+void server_slot_store::remove_leftovers() const {
     const auto now = fs::file_time_type::clock::now();
     std::error_code ec;
     for (fs::directory_iterator it(fs::u8path(dir), ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code ec_fp;
         for (fs::directory_iterator jt(it->path(), ec_fp), end_fp; !ec_fp && jt != end_fp; jt.increment(ec_fp)) {
-            if (jt->path().extension() != ".tmp") {
+            const fs::path & p = jt->path();
+            if (p.extension() == BLAKE3_EXT) {
+                std::error_code ec_slot;
+                if (p.stem().extension() != SLOT_EXT || fs::exists(fs::path(p).replace_extension(), ec_slot) || ec_slot) {
+                    continue;
+                }
+            } else if (p.extension() != ".tmp") {
                 continue;
             }
             std::error_code ec_file;

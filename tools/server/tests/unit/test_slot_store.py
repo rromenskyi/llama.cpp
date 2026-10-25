@@ -91,13 +91,13 @@ def test_save_is_atomic_and_listed():
     assert res.status_code == 200
     assert res.body["n_saved"] == 84
     assert res.body["n_written"] == os.path.getsize(store_path(FP, "k1.slot"))
-    # saved under the final name, no temporary file left behind
-    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    # saved under the final name with its hash, no temporary file left behind
+    assert sorted(os.listdir(store_path(FP))) == ["k1.slot", "k1.slot.blake3"]
 
     # a second save replaces the file
     res = save(1, "k1.slot")
     assert res.status_code == 200
-    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    assert sorted(os.listdir(store_path(FP))) == ["k1.slot", "k1.slot.blake3"]
 
     res = server.make_request("GET", "/slot-store")
     assert res.status_code == 200
@@ -187,7 +187,8 @@ def test_evict():
     ]})
     assert res.status_code == 200
     assert res.body == {"removed": 2}
-    assert os.listdir(store_path(FP)) == ["k2.slot"]
+    # the hash file goes with its slot file
+    assert sorted(os.listdir(store_path(FP))) == ["k2.slot", "k2.slot.blake3"]
     assert os.listdir(store_path("fp0")) == []
 
     res = server.make_request("GET", "/slot-store")
@@ -350,11 +351,15 @@ def test_janitor_removes_old_tmp():
     write_file(store_path("fpx", ".a.1.tmp"), age_s=7200)
     write_file(store_path("fpx", ".b.2.tmp"))
     write_file(store_path("fpx", "c.slot"), age_s=7200)
+    write_file(store_path("fpx", "c.slot.blake3"), age_s=7200)
+    # hash files without their slot file: an old one is a leftover, a new one may belong to a save in progress
+    write_file(store_path("fpx", "d.slot.blake3"), age_s=7200)
+    write_file(store_path("fpx", "e.slot.blake3"))
     server.start()
     t_end = time.time() + 5
-    while os.path.exists(store_path("fpx", ".a.1.tmp")) and time.time() < t_end:
+    while (os.path.exists(store_path("fpx", ".a.1.tmp")) or os.path.exists(store_path("fpx", "d.slot.blake3"))) and time.time() < t_end:
         time.sleep(0.1)
-    assert sorted(os.listdir(store_path("fpx"))) == [".b.2.tmp", "c.slot"]
+    assert sorted(os.listdir(store_path("fpx"))) == [".b.2.tmp", "c.slot", "c.slot.blake3", "e.slot.blake3"]
 
 
 @pytest.mark.parametrize("mode,ok", [("after", True), ("before", False)])
@@ -368,10 +373,11 @@ def test_rename_error_counts_as_success(monkeypatch, mode, ok):
     res = save(1, "k1.slot")
     if ok:
         assert res.status_code == 200
-        assert os.listdir(store_path(FP)) == ["k1.slot"]
+        assert sorted(os.listdir(store_path(FP))) == ["k1.slot", "k1.slot.blake3"]
     else:
         assert res.status_code == 500
-        assert os.listdir(store_path(FP)) == []
+        # the hash file is published before the rename, the janitor removes it later
+        assert os.listdir(store_path(FP)) == ["k1.slot.blake3"]
 
 
 def test_short_file_keeps_previous_slot(monkeypatch):
@@ -386,3 +392,66 @@ def test_short_file_keeps_previous_slot(monkeypatch):
     assert "bytes" in res.body["error"]["message"]
     assert os.listdir(store_path(FP)) == ["k1.slot"]
     assert open(store_path(FP, "k1.slot"), "rb").read() == b"previous"
+
+
+def restore(id_slot: int, filename: str):
+    return server.make_request("POST", f"/slots/{id_slot}?action=restore", data={"filename": filename})
+
+
+def prompt_n_germany(id_slot: int) -> int:
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?",
+        "id_slot": id_slot,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    return res.body["timings"]["prompt_n"]
+
+
+def test_save_writes_hash():
+    global server
+    server.start()
+    fill_slot(1)
+    assert save(1, "k1.slot").status_code == 200
+    text = open(store_path(FP, "k1.slot.blake3"), "rb").read()
+    assert re.fullmatch(rb"[0-9a-f]{64}\n", text)
+    # the listing has only slot files, the size is the one of the slot file
+    res = server.make_request("GET", "/slot-store")
+    assert [(f["key"], f["size"]) for f in res.body["files"]] == [("k1", os.path.getsize(store_path(FP, "k1.slot")))]
+
+
+@pytest.mark.parametrize("damage", ["flip", "no_hash", "bad_hash"])
+def test_restore_damaged_fails(damage):
+    global server
+    server.start()
+    fill_slot(1)
+    assert save(1, "k1.slot").status_code == 200
+    path = store_path(FP, "k1.slot")
+    if damage == "flip":
+        # flip one byte in place, the size stays the same
+        with open(path, "r+b") as f:
+            f.seek(os.path.getsize(path) // 2)
+            c = f.read(1)
+            f.seek(-1, os.SEEK_CUR)
+            f.write(bytes([c[0] ^ 0xff]))
+    elif damage == "no_hash":
+        os.remove(path + ".blake3")
+    else:
+        write_file(path + ".blake3", data=b"0" * 64 + b"\n")
+
+    # slot 0 holds the shared prefix before the restore
+    fill_slot(0)
+    res = restore(0, "k1.slot")
+    assert res.status_code == 400
+    msg = res.body["error"]["message"]
+    if damage == "no_hash":
+        assert "cannot read the hash file" in msg
+    else:
+        assert "checksum mismatch" in msg
+    # the failed restore leaves the slot empty: the whole prompt is processed
+    assert prompt_n_germany(0) > 6
+
+    # a good file restores again
+    assert save(1, "k1.slot").status_code == 200
+    assert restore(0, "k1.slot").status_code == 200
+    assert prompt_n_germany(0) == 6

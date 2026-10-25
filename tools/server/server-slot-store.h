@@ -10,7 +10,8 @@
 #include <thread>
 
 // slot files on a shared directory, see --slot-store
-// layout: <dir>/<fingerprint>/<key>.slot, the directory can be a soft-mounted NFS volume shared by many servers
+// layout: <dir>/<fingerprint>/<key>.slot and its BLAKE3 hash <key>.slot.blake3, the directory can be a soft-mounted NFS
+// volume shared by many servers
 
 // a fingerprint or a key: 1 to 128 characters of [A-Za-z0-9_-]
 bool slot_store_valid_name(const std::string & name);
@@ -21,8 +22,11 @@ bool slot_store_valid_filename(const std::string & filename);
 // a unique temporary file next to path: .<key>.<random>.tmp
 std::string slot_store_tmp_path(const std::string & path);
 
-// fsync tmp, check that it holds n_bytes, and rename it to path; on failure tmp is removed
+// fsync tmp, check that it holds n_bytes, publish its hash as path.blake3, and rename it to path; on failure tmp is removed
 bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err);
+
+// check path against the hash in path.blake3
+bool slot_store_verify(const std::string & path, std::string & err);
 
 struct server_slot_store {
     // creates <dir>/<fingerprint>/ and starts the janitor, throws on error
@@ -58,5 +62,5 @@ private:
     std::thread             janitor;
 
     void router_seen();
-    void remove_old_tmp() const;
+    void remove_leftovers() const;
 };

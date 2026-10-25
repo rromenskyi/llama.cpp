@@ -3112,6 +3112,11 @@ private:
 
                     size_t nread = 0;
                     try {
+                        std::string err_verify;
+                        if (!params_base.slot_store.empty() && !slot_store_verify(filepath, err_verify)) {
+                            throw std::runtime_error(err_verify);
+                        }
+
                         size_t n_packed = 0;
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);

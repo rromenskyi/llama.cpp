@@ -919,6 +919,16 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Like llama_state_seq_save_file, into a buffer: the bytes that the file would hold
+    // With dst == NULL, returns the size needed; otherwise the number of bytes written, 0 on error
+    LLAMA_API size_t llama_state_seq_save_buffer(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
     // Like llama_state_seq_load_file, from the contents of a file written by llama_state_seq_save_file
     // Returns the number of bytes of src used, 0 on error
     LLAMA_API size_t llama_state_seq_load_buffer(

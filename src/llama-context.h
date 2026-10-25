@@ -189,6 +189,13 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    size_t state_seq_save_buffer(
+          llama_seq_id   seq_id,
+               uint8_t * dst,
+                size_t   size,
+     const llama_token * tokens,
+                size_t   n_token_count);
+
     size_t state_seq_load_buffer(
           llama_seq_id   seq_id,
          const uint8_t * src,

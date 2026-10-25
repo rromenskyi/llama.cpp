@@ -3645,6 +3645,33 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+size_t llama_context::state_seq_save_buffer(llama_seq_id seq_id, uint8_t * dst, size_t size, const llama_token * tokens, size_t n_token_count) {
+    // the same layout as state_seq_save_file
+    auto write = [&](llama_io_write_i & io) {
+        const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
+        const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+        const uint32_t n_token = (uint32_t) n_token_count;
+        io.write(&magic,   sizeof(magic));
+        io.write(&version, sizeof(version));
+        io.write(&n_token, sizeof(n_token));
+        io.write(tokens, sizeof(llama_token) * n_token_count);
+        return state_seq_write_data(io, seq_id, 0);
+    };
+
+    if (dst == nullptr) {
+        llama_io_write_dummy io(false);
+        return write(io);
+    }
+
+    // note: the host writer copies the tensor data when it is destroyed
+    size_t res = 0;
+    {
+        llama_io_write_host io(dst, size);
+        res = write(io);
+    }
+    return res;
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
@@ -4632,6 +4659,17 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_buffer(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_buffer(seq_id, dst, size, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
         return 0;
     }
 }

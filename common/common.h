@@ -712,6 +712,7 @@ struct common_params {
     std::string slot_store;       // shared slot directory, slots are saved to <slot_store>/<slot_fingerprint>/
     std::string slot_fingerprint;
     std::string slot_instance;    // returned by GET /slot-store/info
+    int64_t     slot_max_bytes = 8LL << 30; // a larger slot file in the slot store is not restored
     std::string model_cache;      // shared model directory, -mu is downloaded to <model_cache>/<model_sha256>.gguf
     std::string model_sha256;
     std::string mmproj_sha256;

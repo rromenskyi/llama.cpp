@@ -121,6 +121,7 @@ class ServerProcess:
     slot_store: str | None = None
     slot_fingerprint: str | None = None
     slot_instance: str | None = None
+    slot_max_bytes: int | None = None
     model_cache: str | None = None
     model_sha256: str | None = None
     mmproj_sha256: str | None = None
@@ -312,6 +313,8 @@ class ServerProcess:
             server_args.extend(["--slot-fingerprint", self.slot_fingerprint])
         if self.slot_instance is not None:
             server_args.extend(["--slot-instance", self.slot_instance])
+        if self.slot_max_bytes is not None:
+            server_args.extend(["--slot-max-bytes", self.slot_max_bytes])
         if self.model_cache is not None:
             server_args.extend(["--model-cache", self.model_cache])
         if self.model_sha256 is not None:

@@ -14,6 +14,8 @@
 #include <random>
 #include <vector>
 
+#include <sys/stat.h>
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -104,7 +106,7 @@ static bool append_trailer(const std::string & path, std::string & err) {
     return ok;
 }
 
-bool slot_store_read(const std::string & path, bool checked, std::vector<uint8_t> & data, std::string & err) {
+bool slot_store_read(const std::string & path, int64_t max_bytes, std::vector<uint8_t> & data, std::string & err) {
     // test hook: overwrites the file once it was read, like another server replacing it during a restore
     static const bool test_replace = getenv("LLAMA_SERVER_TEST_RESTORE_REPLACE") != nullptr;
 
@@ -114,33 +116,44 @@ bool slot_store_read(const std::string & path, bool checked, std::vector<uint8_t
         err = std::string("open: ") + strerror(errno);
         return false;
     }
-    std::error_code ec;
-    const uintmax_t size_hint = fs::file_size(fs::u8path(path), ec);
-    if (!ec) {
-        data.reserve(size_hint);
+#ifdef _WIN32
+    struct _stat64 st;
+    const int rc_stat = _fstat64(_fileno(f), &st);
+#else
+    struct stat st;
+    const int rc_stat = fstat(fileno(f), &st);
+#endif
+    if (rc_stat != 0) {
+        err = std::string("stat: ") + strerror(errno);
+        fclose(f);
+        return false;
     }
-    std::vector<uint8_t> buf(1 << 20);
-    size_t n;
+    if (st.st_size > max_bytes) {
+        err = string_format("the file has %lld bytes, more than --slot-max-bytes %lld", (long long) st.st_size, (long long) max_bytes);
+        fclose(f);
+        return false;
+    }
+    data.resize((size_t) st.st_size);
     errno = 0;
-    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
-        data.insert(data.end(), buf.begin(), buf.begin() + n);
-    }
-    const bool failed = ferror(f) != 0;
+    const size_t n = fread(data.data(), 1, data.size(), f);
     const int errno_read = errno;
+    const bool failed = ferror(f) != 0;
+    const bool grew = !failed && n == data.size() && fgetc(f) != EOF;
     fclose(f);
     if (failed) {
         err = std::string("read: ") + strerror(errno_read ? errno_read : EIO);
         return false;
     }
-    if (checked && test_replace) {
+    if (n != data.size() || grew) {
+        err = "the file changed size during the read";
+        return false;
+    }
+    if (test_replace) {
         FILE * fr = ggml_fopen(path.c_str(), "wb");
         if (fr) {
             fputs("replaced", fr);
             fclose(fr);
         }
-    }
-    if (!checked) {
-        return true;
     }
 
     if (data.size() < SLOT_STORE_TRAILER_SIZE ||

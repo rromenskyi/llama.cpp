@@ -509,3 +509,27 @@ def test_concurrent_saves_of_one_key():
         res = restore(0, "k1.slot", s)
         assert res.status_code == 200
         assert res.body["n_restored"] == 84
+
+
+def test_restore_larger_than_max_fails():
+    global server
+    server.slot_max_bytes = 1000
+    server.start()
+    fill_slot(1)
+    assert save(1, "k1.slot").status_code == 200
+    res = restore(0, "k1.slot")
+    assert res.status_code == 400
+    assert "more than --slot-max-bytes 1000" in res.body["error"]["message"]
+
+
+def test_restore_huge_file_fails_without_allocating():
+    # a sparse 1 TiB file is rejected from its size, before any buffer is allocated
+    global server
+    server.start()
+    path = store_path(FP, "huge.slot")
+    with open(path, "wb") as f:
+        f.truncate(1 << 40)
+    res = restore(0, "huge.slot")
+    assert res.status_code == 400
+    assert "more than --slot-max-bytes" in res.body["error"]["message"]
+    assert server.make_request("GET", "/health").status_code == 200

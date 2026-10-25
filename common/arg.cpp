@@ -3716,6 +3716,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_INSTANCE"));
     add_opt(common_arg(
+        {"--slot-max-bytes"}, "N",
+        string_format("with --slot-store, do not restore slot files larger than N bytes (default: %lld)", (long long) params.slot_max_bytes),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long n = std::stoll(value, &pos);
+            if (pos != value.size() || n <= 0) {
+                throw std::invalid_argument("--slot-max-bytes must be a positive number of bytes");
+            }
+            params.slot_max_bytes = n;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_MAX_BYTES"));
+    add_opt(common_arg(
         {"--model-cache"}, "PATH",
         "shared directory for models, needs -mu and --model-sha256; the model is downloaded once to PATH/<sha256>.gguf and verified at every start (default: disabled)",
         [](common_params & params, const std::string & value) {

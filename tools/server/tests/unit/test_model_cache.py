@@ -2,6 +2,7 @@ import glob
 import hashlib
 import http.server
 import os
+import re
 import threading
 import time
 
@@ -463,4 +464,36 @@ def test_bad_sidecar_falls_back_to_sha256(tmp_path, content: bytes):
     assert b3_of_sidecar() == b3
     log = open(tmp_path / "server.log").read()
     assert "checking sha256" in log
+    assert f"verified {final()} with sha256 in " in log
+
+
+def test_loads_from_private_link(tmp_path):
+    # the verified file is loaded through a hard link private to the process, removed once the model is loaded
+    global server
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    log = open(server.log_path).read()
+    link = re.search(r"loading the verified model from '\S*/\." + SHA["/model"] + r"\.\S+\.load'", log)
+    assert link is not None, "the model was not loaded from a private link"
+    assert listing() == cached()
+    res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
+    assert res.status_code == 200
+
+
+def test_unreadable_sidecar_left_alone(tmp_path):
+    global server
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the file mode")
+    write_file(final(), open(FILES["/model"], "rb").read())
+    write_file(sidecar(), b"0" * 64 + b"\n")
+    os.chmod(sidecar(), 0)
+    server.log_path = str(tmp_path / "server.log")
+    try:
+        server.start()
+    finally:
+        os.chmod(sidecar(), 0o644)
+    assert files.gets == {}
+    assert open(sidecar(), "rb").read() == b"0" * 64 + b"\n"
+    log = open(server.log_path).read()
+    assert f"cannot read {sidecar()}: Permission denied, checking sha256" in log
     assert f"verified {final()} with sha256 in " in log

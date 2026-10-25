@@ -505,7 +505,11 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         if (!params.mmproj.url.empty()) {
             files.push_back({params.mmproj.url, params.mmproj_sha256});
         }
-        common_model_cache_get(params.model_cache, files, params.model_cache_ttl, opts);
+        const auto links = common_model_cache_get(params.model_cache, files, params.model_cache_ttl, opts);
+        params.model.path_load = links[0];
+        if (links.size() > 1) {
+            params.mmproj.path_load = links[1];
+        }
     }
 
     // handle plain "url" tasks (non-hf)

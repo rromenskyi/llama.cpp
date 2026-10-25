@@ -1161,8 +1161,29 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
+        if (!params.model.path_load.empty()) {
+            SRV_INF("loading the verified model from '%s'\n", params.model.path_load.c_str());
+        }
 
-        std::string & mmproj_path = params_base.mmproj.path;
+        // the private links to verified --model-cache files are needed only while loading
+        struct release_links {
+            common_params & params_base;
+            common_params & params;
+            ~release_links() {
+                for (const auto * m : {&params_base.model, &params_base.mmproj}) {
+                    if (!m->path_load.empty()) {
+                        std::error_code ec;
+                        std::filesystem::remove(std::filesystem::u8path(m->path_load), ec);
+                    }
+                }
+                for (auto * p : {&params_base, &params}) {
+                    p->model.path_load.clear();
+                    p->mmproj.path_load.clear();
+                }
+            }
+        } links{params_base, params};
+
+        const std::string & mmproj_path = params_base.mmproj.path_load.empty() ? params_base.mmproj.path : params_base.mmproj.path_load;
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;

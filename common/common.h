@@ -308,6 +308,7 @@ struct common_params_model {
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
     std::string docker_repo = ""; // Docker repo
+    std::string path_load   = ""; // if set, the file to load instead of path, e.g. a private link made by --model-cache
 
     std::string get_name() const {
         if (!hf_repo.empty()) {

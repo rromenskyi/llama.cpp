@@ -12,7 +12,7 @@ std::string common_model_cache_path(const std::string & dir, const std::string &
 
 #ifdef _WIN32
 
-void common_model_cache_get(const std::string &, const std::vector<common_model_cache_file> &, int64_t, const common_download_opts &) {
+std::vector<std::string> common_model_cache_get(const std::string &, const std::vector<common_model_cache_file> &, int64_t, const common_download_opts &) {
     throw std::runtime_error("--model-cache is not supported on Windows");
 }
 
@@ -207,7 +207,17 @@ static void evict(const std::string & dir, const std::set<std::string> & keep, i
                     }
                 }
             } else if (name.size() == 76 && is_hex64(name, 0) && name.compare(64, 12, ".gguf.blake3") == 0 &&
-                       keep.count(name.substr(0, 69)) == 0 && !path_exists(path.substr(0, path.size() - 7))) {
+                       keep.count(name.substr(0, 69)) == 0) {
+                // only a model that is surely gone takes its sidecar along, an I/O error leaves both alone
+                const std::string model = path.substr(0, path.size() - 7);
+                struct stat st;
+                if (stat(model.c_str(), &st) == 0) {
+                    continue;
+                }
+                if (errno != ENOENT) {
+                    LOG_WRN("model cache: cannot check %s: %s, keeping %s\n", model.c_str(), strerror(errno), path.c_str());
+                    continue;
+                }
                 LOG_INF("model cache: removing %s without its model\n", path.c_str());
                 if (unlink(path.c_str()) != 0 && errno != ENOENT) {
                     LOG_WRN("model cache: cannot remove %s: %s\n", path.c_str(), strerror(errno));
@@ -240,6 +250,13 @@ struct fetcher {
     std::string tmp_blake3; // of the verified download in tmp
     httplib::Headers headers;
     int asides = 0;
+
+    // the file last hashed, the download, and the final file found good
+    struct stat st_hashed = {};
+    struct stat st_tmp    = {};
+    struct stat st_good   = {};
+
+    bool sidecar_unreadable = false;
 
     // bytes hashed and downloaded, written to the heartbeat
     std::atomic<uint64_t> progress{0};
@@ -275,6 +292,11 @@ struct fetcher {
         FILE * f = fopen(path.c_str(), "rb");
         if (!f) {
             return errno;
+        }
+        if (fstat(fileno(f), &st_hashed) != 0) {
+            const int err = errno;
+            fclose(f);
+            return err;
         }
         sha256_t ctx;
         sha256_init(&ctx);
@@ -317,6 +339,9 @@ struct fetcher {
 
     // publishes the sidecar of a file that hashed right with sha256; a failure only costs a sha256 check later
     void write_sidecar(const std::string & blake3) {
+        if (sidecar_unreadable) {
+            return;
+        }
         const std::string path_tmp = dir + "/." + sha + "." + token + ".blake3.tmp";
         const std::string line = blake3 + "\n";
         int fd = open(path_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -335,6 +360,11 @@ struct fetcher {
         err = 0;
         std::string want;
         if (!read_text(sidecar, want)) {
+            // without the sidecar the sha256 decides; a sidecar that cannot be read is left alone
+            if (errno != ENOENT) {
+                sidecar_unreadable = true;
+                LOG_WRN("model cache: cannot read %s: %s, checking sha256\n", sidecar.c_str(), strerror(errno));
+            }
             return false;
         }
         if (want.size() != 64 || !is_hex64(want, 0)) {
@@ -369,6 +399,7 @@ struct fetcher {
             touch(final_path);
             int err = 0;
             if (check_sidecar(err)) {
+                st_good = st_hashed;
                 return true;
             }
             std::string got;
@@ -388,6 +419,7 @@ struct fetcher {
             if (got == sha) {
                 LOG_INF("model cache: verified %s with sha256 in %.2f s\n", final_path.c_str(), seconds_since(t_start));
                 write_sidecar(got_blake3);
+                st_good = st_hashed;
                 return true;
             }
             const std::string aside = dir + "/." + sha + ".bad." + token + "." + std::to_string(++asides);
@@ -409,6 +441,7 @@ struct fetcher {
                 unlink(aside.c_str());
                 LOG_INF("model cache: verified %s\n", final_path.c_str());
                 write_sidecar(got_blake3);
+                st_good = st_hashed;
                 return true;
             }
             LOG_WRN("model cache: cannot put %s back as %s, leaving it there\n", aside.c_str(), final_path.c_str());
@@ -501,6 +534,9 @@ struct fetcher {
             int & fd;
             ~fd_closer() { if (fd >= 0) { close(fd); } }
         } closer{fd};
+        if (fstat(fd, &st_tmp) != 0) {
+            throw std::runtime_error("cannot stat " + tmp + ": " + strerror(errno));
+        }
 
         auto [cli, parts] = common_http_client(url);
         cli.set_default_headers(headers);
@@ -593,6 +629,7 @@ struct fetcher {
                 if (stat(final_path.c_str(), &st) == 0 && (uint64_t) st.st_size == size) {
                     LOG_INF("model cache: downloaded %s\n", final_path.c_str());
                     write_sidecar(tmp_blake3);
+                    st_good = st_tmp;
                     return true;
                 }
             }
@@ -666,6 +703,27 @@ struct fetcher {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    // runs, then links the final file to a name private to this process, so that the file loaded is the one verified
+    // even if the final file is replaced meanwhile; returns the link, or an empty string when no link can be made
+    std::string get() {
+        const std::string path_link = dir + "/." + sha + "." + token + ".load";
+        for (int round = 0; round < 3; round++) {
+            run();
+            unlink(path_link.c_str());
+            if (link(final_path.c_str(), path_link.c_str()) != 0) {
+                LOG_WRN("model cache: cannot link %s to %s: %s, loading it by its name\n", final_path.c_str(), path_link.c_str(), strerror(errno));
+                return "";
+            }
+            struct stat st;
+            if (stat(path_link.c_str(), &st) == 0 && st.st_dev == st_good.st_dev && st.st_ino == st_good.st_ino) {
+                return path_link;
+            }
+            unlink(path_link.c_str());
+            LOG_WRN("model cache: %s changed after it was verified, verifying again\n", final_path.c_str());
+        }
+        throw std::runtime_error("cannot settle " + final_path);
+    }
+
     void run() {
         int tries = 0;
         int n_transient = 0;
@@ -699,7 +757,7 @@ struct fetcher {
 
 } // namespace
 
-void common_model_cache_get(const std::string & dir, const std::vector<common_model_cache_file> & files, int64_t ttl_s, const common_download_opts & opts) {
+std::vector<std::string> common_model_cache_get(const std::string & dir, const std::vector<common_model_cache_file> & files, int64_t ttl_s, const common_download_opts & opts) {
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (!fs::is_directory(dir)) {
@@ -716,8 +774,9 @@ void common_model_cache_get(const std::string & dir, const std::vector<common_mo
     }
     evict(dir, keep, ttl_s);
 
+    std::vector<std::string> links;
     for (const auto & f : files) {
-        fetcher(dir, f, opts).run();
+        links.push_back(fetcher(dir, f, opts).get());
     }
 
     for (const auto & p : paths) {
@@ -733,6 +792,7 @@ void common_model_cache_get(const std::string & dir, const std::vector<common_mo
             }
         }
     }).detach();
+    return links;
 }
 
 #endif

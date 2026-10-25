@@ -111,6 +111,15 @@ def listing() -> list[str]:
     return sorted(os.listdir(cache))
 
 
+def cached(path: str = "/model") -> list[str]:
+    # a cached model and its blake3 sidecar
+    return [SHA[path] + ".gguf", SHA[path] + ".gguf.blake3"]
+
+
+def sidecar(path: str = "/model") -> str:
+    return final(path) + ".blake3"
+
+
 def sha_of(path: str) -> str:
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
 
@@ -136,7 +145,7 @@ def test_download_and_hit(tmp_path):
     server.log_path = str(tmp_path / "first.log")
     server.start()
     assert files.gets == {"/model": 1}
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
     assert sha_of(final()) == SHA["/model"]
     res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
     assert res.status_code == 200
@@ -148,7 +157,7 @@ def test_download_and_hit(tmp_path):
 
     server.start()
     assert files.gets == {"/model": 1}
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
 
 
 def test_two_servers_one_download(tmp_path):
@@ -169,7 +178,7 @@ def test_two_servers_one_download(tmp_path):
         t.join()
     assert errors == []
     assert files.gets == {"/model": 1}
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
     assert sha_of(final()) == SHA["/model"]
     logs = "".join(open(tmp_path / f"server{i}.log").read() for i in range(3))
     assert "waiting for" in logs
@@ -183,7 +192,7 @@ def test_bad_cached_file_replaced(tmp_path):
     server.log_path = str(tmp_path / "server.log")
     server.start()
     assert files.gets == {"/model": 1}
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
     assert sha_of(final()) == SHA["/model"]
     assert "mismatch" in open(tmp_path / "server.log").read()
 
@@ -208,7 +217,7 @@ def test_servers_start_on_one_bad_file(tmp_path):
         t.join()
     assert errors == []
     assert files.gets == {"/model": 1}
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
     assert sha_of(final()) == SHA["/model"]
     for s in servers:
         res = s.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
@@ -222,7 +231,7 @@ def test_bad_file_published_during_download(tmp_path):
     server.log_path = str(tmp_path / "server.log")
     server.start()
     assert files.gets == {"/model": 1}
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
     assert sha_of(final()) == SHA["/model"]
     assert "mismatch" in open(tmp_path / "server.log").read()
 
@@ -313,7 +322,7 @@ def test_stale_lock_taken_over(tmp_path):
     assert files.gets == {"/model": 2}
     for i, s in enumerate(servers):
         assert s.model_cache is not None
-        assert sorted(os.listdir(s.model_cache)) == [SHA["/model"] + ".gguf"]
+        assert sorted(os.listdir(s.model_cache)) == cached()
         log = open(tmp_path / f"server{i}.log").read()
         assert "took over the stale lock" in log
 
@@ -323,8 +332,13 @@ def test_ttl_eviction():
     day = 24 * 3600
     other = "1" * 64
     young = "2" * 64
+    orphan = "3" * 64
     write_file(os.path.join(cache, f"{other}.gguf"), age_s=8 * day)
+    write_file(os.path.join(cache, f"{other}.gguf.blake3"), b"a" * 64 + b"\n", age_s=8 * day)
     write_file(os.path.join(cache, f"{young}.gguf"), age_s=6 * day)
+    write_file(os.path.join(cache, f"{young}.gguf.blake3"), b"b" * 64 + b"\n", age_s=6 * day)
+    write_file(os.path.join(cache, f"{orphan}.gguf.blake3"), b"c" * 64 + b"\n")
+    write_file(os.path.join(cache, f".{other}.pod-a.1.blake3.tmp"), age_s=2 * 3600)
     write_file(os.path.join(cache, "notes.gguf"), age_s=8 * day)
     write_file(os.path.join(cache, f".{other}.pod-a.1.tmp"), age_s=2 * 3600)
     write_file(os.path.join(cache, f".{young}.pod-a.1.tmp"), age_s=60)
@@ -340,9 +354,9 @@ def test_ttl_eviction():
         f".{young}.lock",
         f".{young}.pod-a.1.tmp",
         f"{young}.gguf",
+        f"{young}.gguf.blake3",
         "notes.gguf",
-        SHA["/model"] + ".gguf",
-    ])
+    ] + cached())
     # the used model is touched at start
     assert time.time() - os.stat(final()).st_mtime < 60
 
@@ -353,7 +367,7 @@ def test_ttl_option():
     write_file(os.path.join(cache, f"{other}.gguf"), age_s=7200)
     server.model_cache_ttl = 3600
     server.start()
-    assert listing() == [SHA["/model"] + ".gguf"]
+    assert listing() == cached()
 
 
 def test_mmproj():
@@ -364,7 +378,89 @@ def test_mmproj():
     server.mmproj_sha256 = SHA["/mmproj"]
     server.start()
     assert files.gets == {"/gemma": 1, "/mmproj": 1}
-    assert listing() == sorted([final("/gemma")[len(cache) + 1:], final("/mmproj")[len(cache) + 1:]])
+    assert listing() == sorted(cached("/gemma") + cached("/mmproj"))
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
     assert res.body["modalities"]["vision"]
+
+
+def b3_of_sidecar(path: str = "/model") -> str:
+    text = open(sidecar(path), "rb").read()
+    assert len(text) == 65 and text.endswith(b"\n")
+    return text[:64].decode()
+
+
+def test_sidecar_written_and_used(tmp_path):
+    global server
+    server.start()
+    server.stop()
+    b3 = b3_of_sidecar()
+    assert all(c in "0123456789abcdef" for c in b3)
+
+    server.log_path = str(tmp_path / "second.log")
+    server.start()
+    assert files.gets == {"/model": 1}
+    assert listing() == cached()
+    assert b3_of_sidecar() == b3
+    log = open(tmp_path / "second.log").read()
+    assert f"verified {final()} with blake3 in " in log
+    assert "with sha256" not in log
+
+
+def test_legacy_file_gets_sidecar(tmp_path):
+    # a file cached before sidecars existed is checked with sha256 once, then with blake3
+    global server
+    write_file(final(), open(FILES["/model"], "rb").read())
+    server.log_path = str(tmp_path / "first.log")
+    server.start()
+    server.stop()
+    assert files.gets == {}
+    assert listing() == cached()
+    assert f"verified {final()} with sha256 in " in open(tmp_path / "first.log").read()
+
+    server.log_path = str(tmp_path / "second.log")
+    server.start()
+    assert f"verified {final()} with blake3 in " in open(tmp_path / "second.log").read()
+
+
+def test_corrupt_model_with_valid_sidecar(tmp_path):
+    global server
+    server.start()
+    server.stop()
+    b3 = b3_of_sidecar()
+    # flip one byte in place, the size stays the same
+    with open(final(), "r+b") as f:
+        f.seek(os.path.getsize(final()) // 2)
+        c = f.read(1)
+        f.seek(-1, os.SEEK_CUR)
+        f.write(bytes([c[0] ^ 0xff]))
+    assert sha_of(final()) != SHA["/model"]
+
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    assert files.gets == {"/model": 2}
+    assert listing() == cached()
+    assert sha_of(final()) == SHA["/model"]
+    assert b3_of_sidecar() == b3
+    log = open(tmp_path / "server.log").read()
+    assert "checking sha256" in log
+    assert "mismatch" in log
+
+
+@pytest.mark.parametrize("content", [b"0" * 64 + b"\n", b"garbage\n", b""])
+def test_bad_sidecar_falls_back_to_sha256(tmp_path, content: bytes):
+    global server
+    server.start()
+    server.stop()
+    b3 = b3_of_sidecar()
+    write_file(sidecar(), content)
+
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    assert files.gets == {"/model": 1}
+    assert listing() == cached()
+    # the sidecar is written again from the file that hashed right with sha256
+    assert b3_of_sidecar() == b3
+    log = open(tmp_path / "server.log").read()
+    assert "checking sha256" in log
+    assert f"verified {final()} with sha256 in " in log

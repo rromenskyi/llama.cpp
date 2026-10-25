@@ -23,6 +23,7 @@ void common_model_cache_get(const std::string &, const std::vector<common_model_
 extern "C" {
 #include "hash/sha256/sha256.h"
 }
+#include "blake3/blake3.h"
 
 #include <algorithm>
 #include <atomic>
@@ -68,16 +69,35 @@ static bool is_hex64(const std::string & s, size_t pos) {
     return true;
 }
 
+static std::string to_hex(const unsigned char * digest, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    for (size_t i = 0; i < len; i++) {
+        out += hex[digest[i] >> 4];
+        out += hex[digest[i] & 0xf];
+    }
+    return out;
+}
+
 static std::string to_hex(sha256_t & ctx) {
     unsigned char digest[SHA256_DIGEST_SIZE];
     sha256_final(&ctx, digest);
-    static const char hex[] = "0123456789abcdef";
-    std::string out;
-    for (unsigned char c : digest) {
-        out += hex[c >> 4];
-        out += hex[c & 0xf];
-    }
-    return out;
+    return to_hex(digest, sizeof(digest));
+}
+
+static std::string to_hex(const blake3_hasher & ctx) {
+    unsigned char digest[BLAKE3_OUT_LEN];
+    blake3_hasher_finalize(&ctx, digest, sizeof(digest));
+    return to_hex(digest, sizeof(digest));
+}
+
+// <dir>/<sha256>.gguf.blake3: the blake3 of a file that hashed right with sha256, checked instead of the slower sha256
+static std::string sidecar_path(const std::string & final_path) {
+    return final_path + ".blake3";
+}
+
+static double seconds_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
 static bool path_exists(const std::string & path) {
@@ -157,7 +177,8 @@ static time_t newest_mtime(const std::string & path) {
     return t;
 }
 
-// removes <sha>.gguf files not touched for ttl_s seconds, except keep, and leftovers .<sha>.* older than an hour
+// removes <sha>.gguf files not touched for ttl_s seconds, except keep, with their <sha>.gguf.blake3, sidecars
+// without their model, and leftovers .<sha>.* older than an hour
 static void evict(const std::string & dir, const std::set<std::string> & keep, int64_t ttl_s) {
     const time_t now = time(nullptr);
     std::error_code ec;
@@ -181,7 +202,15 @@ static void evict(const std::string & dir, const std::set<std::string> & keep, i
                     LOG_INF("model cache: removing %s, not used for %lld s\n", path.c_str(), (long long) (now - st.st_mtime));
                     if (unlink(path.c_str()) != 0 && errno != ENOENT) {
                         LOG_WRN("model cache: cannot remove %s: %s\n", path.c_str(), strerror(errno));
+                    } else {
+                        unlink(sidecar_path(path).c_str());
                     }
+                }
+            } else if (name.size() == 76 && is_hex64(name, 0) && name.compare(64, 12, ".gguf.blake3") == 0 &&
+                       keep.count(name.substr(0, 69)) == 0 && !path_exists(path.substr(0, path.size() - 7))) {
+                LOG_INF("model cache: removing %s without its model\n", path.c_str());
+                if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+                    LOG_WRN("model cache: cannot remove %s: %s\n", path.c_str(), strerror(errno));
                 }
             }
         }
@@ -203,10 +232,12 @@ struct fetcher {
     std::string url;
     std::string sha;
     std::string final_path;
+    std::string sidecar;
     std::string lock;
     std::string me;
     std::string token;
     std::string tmp;
+    std::string tmp_blake3; // of the verified download in tmp
     httplib::Headers headers;
     int asides = 0;
 
@@ -216,6 +247,7 @@ struct fetcher {
     fetcher(const std::string & dir, const common_model_cache_file & file, const common_download_opts & opts)
         : dir(dir), url(file.url), sha(file.sha256) {
         final_path = common_model_cache_path(dir, sha);
+        sidecar = sidecar_path(final_path);
         lock = dir + "/." + sha + ".lock";
 
         char host[256] = "host";
@@ -237,34 +269,43 @@ struct fetcher {
         }
     }
 
+    // computes the blake3 of the file, and its sha256 unless sha_out is null, in one pass
     // returns 0, or the errno of the failed open or read
-    int hash_once(const std::string & path, std::string & out) {
+    int hash_once(const std::string & path, std::string * sha_out, std::string & blake3_out) {
         FILE * f = fopen(path.c_str(), "rb");
         if (!f) {
             return errno;
         }
         sha256_t ctx;
         sha256_init(&ctx);
+        blake3_hasher ctx_b3;
+        blake3_hasher_init(&ctx_b3);
         std::vector<unsigned char> buf(1 << 20);
         size_t n;
         errno = 0;
         while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
-            sha256_update(&ctx, buf.data(), n);
+            if (sha_out) {
+                sha256_update(&ctx, buf.data(), n);
+            }
+            blake3_hasher_update(&ctx_b3, buf.data(), n);
             progress += n;
         }
         const int err = ferror(f) ? (errno ? errno : EIO) : 0;
         fclose(f);
         if (err == 0) {
-            out = to_hex(ctx);
+            if (sha_out) {
+                *sha_out = to_hex(ctx);
+            }
+            blake3_out = to_hex(ctx_b3);
         }
         return err;
     }
 
     // like hash_once, but tries again after a transient read error
-    int hash_file(const std::string & path, std::string & out) {
+    int hash_file(const std::string & path, std::string * sha_out, std::string & blake3_out) {
         int err = 0;
         for (int attempt = 1; attempt <= HASH_ATTEMPTS; attempt++) {
-            err = hash_once(path, out);
+            err = hash_once(path, sha_out, blake3_out);
             if ((err != EIO && err != ESTALE) || attempt == HASH_ATTEMPTS) {
                 break;
             }
@@ -274,9 +315,51 @@ struct fetcher {
         return err;
     }
 
+    // publishes the sidecar of a file that hashed right with sha256; a failure only costs a sha256 check later
+    void write_sidecar(const std::string & blake3) {
+        const std::string path_tmp = dir + "/." + sha + "." + token + ".blake3.tmp";
+        const std::string line = blake3 + "\n";
+        int fd = open(path_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        bool ok = fd >= 0 && write_all(fd, line.data(), line.size()) && fsync(fd) == 0;
+        ok = fd >= 0 && close(fd) == 0 && ok;
+        ok = ok && rename(path_tmp.c_str(), sidecar.c_str()) == 0;
+        if (!ok) {
+            LOG_WRN("model cache: cannot write %s: %s\n", sidecar.c_str(), strerror(errno));
+            unlink(path_tmp.c_str());
+        }
+    }
+
+    // true: the final file matches its sidecar; false: it does not, or there is no valid sidecar
+    // returns the errno of a failed read of the final file in err
+    bool check_sidecar(int & err) {
+        err = 0;
+        std::string want;
+        if (!read_text(sidecar, want)) {
+            return false;
+        }
+        if (want.size() != 64 || !is_hex64(want, 0)) {
+            LOG_WRN("model cache: %s is not a blake3 hash, checking sha256\n", sidecar.c_str());
+            return false;
+        }
+        LOG_INF("model cache: verifying %s with blake3\n", final_path.c_str());
+        const auto t_start = std::chrono::steady_clock::now();
+        std::string got;
+        err = hash_file(final_path, nullptr, got);
+        if (err != 0) {
+            return false;
+        }
+        if (got != want) {
+            LOG_WRN("model cache: %s has blake3 %s, %s has %s, checking sha256\n", final_path.c_str(), got.c_str(), sidecar.c_str(), want.c_str());
+            return false;
+        }
+        LOG_INF("model cache: verified %s with blake3 in %.2f s\n", final_path.c_str(), seconds_since(t_start));
+        return true;
+    }
+
     // true: the final file is good, false: there is no good final file; throws when it cannot be read
-    // a mismatching final file is renamed aside (only one process's rename succeeds) and hashed again
-    // there: another process may have replaced it with a good file in between, which is then linked back.
+    // the blake3 sidecar is checked first; without it, or on a mismatch, the sha256 decides and the sidecar is
+    // written again. a mismatching final file is renamed aside (only one process's rename succeeds) and hashed
+    // again there: another process may have replaced it with a good file in between, which is then linked back.
     // only an aside file that hashed wrong is deleted
     bool check_final() {
         for (int round = 0; path_exists(final_path); round++) {
@@ -284,9 +367,17 @@ struct fetcher {
                 throw std::runtime_error("cannot settle " + final_path);
             }
             touch(final_path);
-            LOG_INF("model cache: verifying %s\n", final_path.c_str());
+            int err = 0;
+            if (check_sidecar(err)) {
+                return true;
+            }
             std::string got;
-            const int err = hash_file(final_path, got);
+            std::string got_blake3;
+            const auto t_start = std::chrono::steady_clock::now();
+            if (err == 0) {
+                LOG_INF("model cache: verifying %s with sha256\n", final_path.c_str());
+                err = hash_file(final_path, &got, got_blake3);
+            }
             if (err == ENOENT || err == ESTALE) {
                 // another process moved it aside meanwhile
                 continue;
@@ -295,7 +386,8 @@ struct fetcher {
                 throw std::runtime_error("cannot read " + final_path + ": " + strerror(err));
             }
             if (got == sha) {
-                LOG_INF("model cache: verified %s\n", final_path.c_str());
+                LOG_INF("model cache: verified %s with sha256 in %.2f s\n", final_path.c_str(), seconds_since(t_start));
+                write_sidecar(got_blake3);
                 return true;
             }
             const std::string aside = dir + "/." + sha + ".bad." + token + "." + std::to_string(++asides);
@@ -304,7 +396,7 @@ struct fetcher {
             if (!path_exists(aside)) {
                 continue;
             }
-            if (const int err = hash_file(aside, got); err != 0) {
+            if (const int err = hash_file(aside, &got, got_blake3); err != 0) {
                 throw std::runtime_error("cannot read " + aside + ": " + strerror(err) + ", leaving it there");
             }
             if (got != sha) {
@@ -313,9 +405,10 @@ struct fetcher {
                 continue;
             }
             LOG_INF("model cache: %s was replaced with a good file meanwhile, putting it back\n", final_path.c_str());
-            if (link(aside.c_str(), final_path.c_str()) == 0 || (hash_file(final_path, got) == 0 && got == sha)) {
+            if (link(aside.c_str(), final_path.c_str()) == 0 || (hash_file(final_path, &got, got_blake3) == 0 && got == sha)) {
                 unlink(aside.c_str());
                 LOG_INF("model cache: verified %s\n", final_path.c_str());
+                write_sidecar(got_blake3);
                 return true;
             }
             LOG_WRN("model cache: cannot put %s back as %s, leaving it there\n", aside.c_str(), final_path.c_str());
@@ -415,6 +508,7 @@ struct fetcher {
         cli.set_read_timeout(LOW_SPEED_SECONDS);
 
         sha256_t ctx;
+        blake3_hasher ctx_b3;
         uint64_t n = 0;
         for (int attempt = 1; ; attempt++) {
             // no resume: every attempt starts from the beginning
@@ -422,6 +516,7 @@ struct fetcher {
                 throw std::runtime_error("cannot truncate " + tmp + ": " + strerror(errno));
             }
             sha256_init(&ctx);
+            blake3_hasher_init(&ctx_b3);
             n = 0;
             int status = -1;
             bool write_failed = false;
@@ -440,6 +535,7 @@ struct fetcher {
                         return false;
                     }
                     sha256_update(&ctx, (const unsigned char *) data, len);
+                    blake3_hasher_update(&ctx_b3, data, len);
                     n += len;
                     n_window += len;
                     progress += len;
@@ -485,6 +581,7 @@ struct fetcher {
         if (got != sha) {
             throw std::runtime_error("mismatch: " + url_for_log(url) + " has sha256 " + got + ", want " + sha);
         }
+        tmp_blake3 = to_hex(ctx_b3);
         return n;
     }
 
@@ -495,6 +592,7 @@ struct fetcher {
                 struct stat st;
                 if (stat(final_path.c_str(), &st) == 0 && (uint64_t) st.st_size == size) {
                     LOG_INF("model cache: downloaded %s\n", final_path.c_str());
+                    write_sidecar(tmp_blake3);
                     return true;
                 }
             }

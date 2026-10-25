@@ -151,7 +151,7 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC  llama-common-base)
-target_link_libraries(${TARGET} PRIVATE cpp-httplib vendor::hash)
+target_link_libraries(${TARGET} PRIVATE cpp-httplib vendor::hash vendor::blake3)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)

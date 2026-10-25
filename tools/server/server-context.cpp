@@ -28,6 +28,12 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <new>
+#include <streambuf>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -939,6 +945,150 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 // server_context_impl (private implementation)
 //
 
+// appends to a vector, lets the slot file appendices be written to memory
+struct vector_streambuf : std::streambuf {
+    std::vector<uint8_t> & buf;
+
+    explicit vector_streambuf(std::vector<uint8_t> & buf) : buf(buf) {}
+
+    std::streamsize xsputn(const char * s, std::streamsize n) override {
+        buf.insert(buf.end(), (const uint8_t *) s, (const uint8_t *) s + n);
+        return n;
+    }
+
+    int_type overflow(int_type c) override {
+        if (!traits_type::eq_int_type(c, traits_type::eof())) {
+            buf.push_back((uint8_t) traits_type::to_char_type(c));
+        }
+        return traits_type::not_eof(c);
+    }
+};
+
+// with --slot-store, writes slot snapshots to the store on one background thread and sends the save results
+// the thread only gets the snapshot bytes, it never touches the llama context or the slots
+struct server_slot_writer {
+    // snapshots queued or being written, a bound on the memory they hold
+    static constexpr int MAX_PENDING = 2;
+
+    struct job {
+        int id_task;
+        int id_slot;
+        std::string filename;
+        std::string filepath;
+        size_t n_tokens;
+
+        std::unique_ptr<uint8_t[]> data; // the slot file without the trailer
+        size_t size;
+
+        int64_t t_start_us;    // the save started
+        int64_t t_snapshot_us; // the snapshot was taken
+    };
+
+    explicit server_slot_writer(server_response & queue_results) : queue_results(queue_results) {}
+
+    ~server_slot_writer() {
+        finish();
+    }
+
+    int n_pending() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return n_jobs;
+    }
+
+    void push(job && j) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!thread.joinable()) {
+            stop = false;
+            thread = std::thread([this]() { run(); });
+        }
+        jobs.push_back(std::move(j));
+        n_jobs++;
+        cv.notify_all();
+    }
+
+    // writes every pending snapshot and stops the thread, a later push starts it again
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!thread.joinable()) {
+                return;
+            }
+            if (n_jobs > 0) {
+                SRV_INF("waiting for %d pending slot save(s)\n", n_jobs);
+            }
+            stop = true;
+        }
+        cv.notify_all();
+        thread.join();
+    }
+
+private:
+    server_response & queue_results;
+
+    std::mutex              mutex;
+    std::condition_variable cv;
+    std::deque<job>         jobs;
+    int                     n_jobs = 0; // queued or being written
+    bool                    stop   = false;
+    std::thread             thread;
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            cv.wait(lock, [this] { return stop || !jobs.empty(); });
+            if (jobs.empty()) {
+                return;
+            }
+            job j = std::move(jobs.front());
+            jobs.pop_front();
+            lock.unlock();
+            write(j);
+            lock.lock();
+            n_jobs--;
+        }
+    }
+
+    void write(job & j) {
+        // test hook: a slow store
+        static const int test_delay_ms = [] {
+            const char * val = getenv("LLAMA_SERVER_TEST_SLOT_WRITE_DELAY_MS");
+            return val ? atoi(val) : 0;
+        }();
+        if (test_delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(test_delay_ms));
+        }
+
+        const int64_t t_write_us = ggml_time_us();
+        std::string err;
+        const bool ok = slot_store_save(j.filepath, j.data.get(), j.size, err);
+        j.data.reset();
+        const int64_t t_end_us = ggml_time_us();
+
+        if (!ok) {
+            SRV_WRN("slot %d: unable to save slot to '%s': %s\n", j.id_slot, j.filepath.c_str(), err.c_str());
+            auto res = std::make_unique<server_task_result_error>();
+            res->id       = j.id_task;
+            res->err_type = ERROR_TYPE_SERVER;
+            res->err_msg  = "Unable to save slot: " + err;
+            queue_results.send(std::move(res));
+            return;
+        }
+
+        SRV_INF("slot %d: saved to '%s': snapshot %.2f s, write %.2f s, %.1f MiB\n", j.id_slot, j.filepath.c_str(),
+                (j.t_snapshot_us - j.t_start_us) / 1e6, (t_end_us - t_write_us) / 1e6, (j.size + SLOT_STORE_TRAILER_SIZE) / 1024.0 / 1024.0);
+
+        auto res = std::make_unique<server_task_result_slot_save_load>();
+        res->id       = j.id_task;
+        res->id_slot  = j.id_slot;
+        res->filename = j.filename;
+        res->is_save  = true;
+        res->n_tokens = j.n_tokens;
+        res->n_bytes  = j.size + SLOT_STORE_TRAILER_SIZE;
+        res->t_ms     = (t_end_us - j.t_start_us) / 1000.0;
+        queue_results.send(std::move(res));
+    }
+};
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -957,6 +1107,9 @@ public:
 
     server_queue    queue_tasks;
     server_response queue_results;
+
+    // note: after queue_results, it sends results until it is destroyed
+    server_slot_writer slot_writer{queue_results};
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -2909,6 +3062,83 @@ private:
         return n_read;
     }
 
+    static std::string slot_too_large(size_t n_bytes, int64_t max_bytes) {
+        return string_format("Unable to save slot: %zu bytes, more than --slot-max-bytes %lld, the file could not be restored",
+                n_bytes, (long long) max_bytes);
+    }
+
+    // with --slot-store: takes a snapshot of the slot file in memory and lets slot_writer write it, the slot is free again at once
+    // returns false to save synchronously instead: MAX_PENDING snapshots are pending already, or there is no memory for one
+    bool save_slot_async(const server_task & task, const server_slot & slot, const std::vector<char> & packed, int64_t t_start) {
+        // test hook: always save synchronously
+        static const bool test_sync = getenv("LLAMA_SERVER_TEST_SLOT_SAVE_SYNC") != nullptr;
+        if (test_sync) {
+            return false;
+        }
+        const int n_pending = slot_writer.n_pending();
+        if (n_pending >= server_slot_writer::MAX_PENDING) {
+            SLT_INF(slot, "%d slot saves pending, saving synchronously\n", n_pending);
+            return false;
+        }
+
+        const llama_token * tokens   = reinterpret_cast<const llama_token *>(packed.data());
+        const size_t        n_tokens = packed.size() / sizeof(llama_token);
+
+        // the appendices follow the llama state, as in the file
+        std::vector<uint8_t> appendix;
+        {
+            vector_streambuf sb(appendix);
+            std::ostream os(&sb);
+            size_t n_written = 0;
+            if (!slot.prompt.checkpoints.empty()) {
+                write_slot_checkpoints(os, slot, n_written);
+            }
+            std::vector<uint8_t> data_dft;
+            std::vector<uint8_t> data_spec;
+            get_slot_draft(slot, data_dft, data_spec);
+            if (!data_dft.empty() || !data_spec.empty()) {
+                write_slot_draft(os, data_dft, data_spec, n_written);
+            }
+        }
+
+        const size_t n_state = llama_state_seq_save_buffer(ctx_tgt, nullptr, 0, slot.id, tokens, n_tokens);
+        if (n_state == 0) {
+            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+            return true;
+        }
+        const size_t n_bytes = n_state + appendix.size();
+        if ((uint64_t) (n_bytes + SLOT_STORE_TRAILER_SIZE) > (uint64_t) params_base.slot_max_bytes) {
+            send_error(task, slot_too_large(n_bytes + SLOT_STORE_TRAILER_SIZE, params_base.slot_max_bytes), ERROR_TYPE_SERVER);
+            return true;
+        }
+
+        std::unique_ptr<uint8_t[]> data(new (std::nothrow) uint8_t[n_bytes]);
+        if (!data) {
+            SLT_WRN(slot, "cannot allocate %.1f MiB for a slot snapshot, saving synchronously\n", n_bytes / 1024.0 / 1024.0);
+            return false;
+        }
+        if (llama_state_seq_save_buffer(ctx_tgt, data.get(), n_state, slot.id, tokens, n_tokens) != n_state) {
+            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+            return true;
+        }
+        if (!appendix.empty()) {
+            memcpy(data.get() + n_state, appendix.data(), appendix.size());
+        }
+
+        server_slot_writer::job j;
+        j.id_task       = task.id;
+        j.id_slot       = slot.id;
+        j.filename      = task.slot_action.filename;
+        j.filepath      = task.slot_action.filepath;
+        j.n_tokens      = slot.prompt.tokens.size();
+        j.data          = std::move(data);
+        j.size          = n_bytes;
+        j.t_start_us    = t_start;
+        j.t_snapshot_us = ggml_time_us();
+        slot_writer.push(std::move(j));
+        return true;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3109,6 +3339,11 @@ private:
                         break;
                     }
 
+                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    if (!params_base.slot_store.empty() && save_slot_async(task, *slot, packed, t_start)) {
+                        break;
+                    }
+
                     // with --slot-store, write a temporary file and rename it once it is complete
                     const bool use_tmp = !params_base.slot_store.empty();
                     const std::string filepath_write = use_tmp ? slot_store_tmp_path(filepath) : filepath;
@@ -3119,7 +3354,6 @@ private:
                         }
                     };
 
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
                     const size_t nwrite = llama_state_seq_save_file(
                         ctx_tgt, filepath_write.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
@@ -3140,6 +3374,13 @@ private:
                     if (!save_slot_draft(filepath_write, *slot, nwrite_dft)) {
                         remove_tmp();
                         send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    const size_t nwrite_all = nwrite + nwrite_ckpt + nwrite_dft + SLOT_STORE_TRAILER_SIZE;
+                    if (use_tmp && (uint64_t) nwrite_all > (uint64_t) params_base.slot_max_bytes) {
+                        remove_tmp();
+                        send_error(task, slot_too_large(nwrite_all, params_base.slot_max_bytes), ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -4933,6 +5174,8 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // the HTTP server is still up here, a save request waiting for its file gets the result
+    impl->slot_writer.finish();
 }
 
 void server_context::terminate() {

@@ -2,6 +2,7 @@ import os
 import signal
 import re
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -513,10 +514,12 @@ def test_concurrent_saves_of_one_key():
 
 def test_restore_larger_than_max_fails():
     global server
-    server.slot_max_bytes = 1000
     server.start()
     fill_slot(1)
     assert save(1, "k1.slot").status_code == 200
+    server.stop()
+    server.slot_max_bytes = 1000
+    server.start()
     res = restore(0, "k1.slot")
     assert res.status_code == 400
     assert "more than --slot-max-bytes 1000" in res.body["error"]["message"]
@@ -533,3 +536,168 @@ def test_restore_huge_file_fails_without_allocating():
     assert res.status_code == 400
     assert "more than --slot-max-bytes" in res.body["error"]["message"]
     assert server.make_request("GET", "/health").status_code == 200
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_save_larger_than_max_fails(monkeypatch, sync):
+    # a file larger than --slot-max-bytes could not be restored: the save fails, async or not
+    global server
+    if sync:
+        monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_SAVE_SYNC", "1")
+    write_file(store_path(FP, "k1.slot"), data=b"previous")
+    server.slot_max_bytes = 1000
+    server.start()
+    fill_slot(1)
+    res = save(1, "k1.slot")
+    assert res.status_code == 500
+    assert "more than --slot-max-bytes 1000" in res.body["error"]["message"]
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+    assert open(store_path(FP, "k1.slot"), "rb").read() == b"previous"
+
+
+def save_in_thread(id_slot: int, filename: str, results: list, timeout: float | None = None):
+    def run():
+        t0 = time.time()
+        try:
+            res = server.make_request("POST", f"/slots/{id_slot}?action=save", data={"filename": filename}, timeout=timeout)
+            results.append((filename, res.status_code, res.body, time.time() - t0))
+        except Exception as e:
+            results.append((filename, None, e, time.time() - t0))
+    t = threading.Thread(target=run)
+    t.start()
+    return t
+
+
+SWA_BASE = "The quick brown fox jumps over the lazy dog. " * 20
+
+
+@pytest.mark.parametrize("appendix", [False, True])
+def test_async_save_matches_sync_save(monkeypatch, tmp_path, appendix):
+    # two slow saves fill the writer, the third one is written synchronously from the same slot content
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_WRITE_DELAY_MS", "2000")
+    if appendix:
+        # a SWA model with a draft model: the file also holds the context checkpoint and the draft state appendices
+        store = server.slot_store
+        server = ServerPreset.tinygemma3()
+        server.temperature = 0.0
+        server.cache_ram = 0
+        server.n_ubatch = 32
+        server.model_draft_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
+        server.spec_type = "draft-simple"
+        server.slot_store = store
+        server.slot_fingerprint = FP
+        server.router_lost = 0
+        server.drain_idle_exit = 0
+        prompt = SWA_BASE + "The first ending of this story is a happy one."
+    else:
+        prompt = "What is the capital of France?"
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    res = server.make_request("POST", "/completion", data={"prompt": prompt, "id_slot": 1, "cache_prompt": True})
+    assert res.status_code == 200
+
+    results = []
+    threads = [save_in_thread(1, "a1.slot", results)]
+    time.sleep(0.3)
+    threads.append(save_in_thread(1, "a2.slot", results))
+    time.sleep(0.3)
+    res = save(1, "s1.slot")
+    assert res.status_code == 200
+    # the synchronous save did not wait for the writer
+    assert sorted(os.listdir(store_path(FP))) == ["s1.slot"]
+    for t in threads:
+        t.join()
+    assert sorted((r[0], r[1]) for r in results) == [("a1.slot", 200), ("a2.slot", 200)]
+    assert all(r[3] >= 2 for r in results)
+
+    files = {name: open(store_path(FP, name), "rb").read() for name in ["a1.slot", "a2.slot", "s1.slot"]}
+    assert files["a1.slot"] == files["s1.slot"]
+    assert files["a2.slot"] == files["s1.slot"]
+    if appendix:
+        assert struct.pack("<II", 0x504b4353, 1) in files["s1.slot"]  # "SCKP" v1
+        assert struct.pack("<II", 0x54464453, 1) in files["s1.slot"]  # "SDFT" v1
+    n_saved = res.body["n_saved"]
+    assert n_saved > 0
+    assert res.body["n_written"] == len(files["s1.slot"])
+    for r in results:
+        assert r[2]["n_saved"] == n_saved
+        assert r[2]["n_written"] == len(files["s1.slot"])
+    assert sorted(os.listdir(store_path(FP))) == ["a1.slot", "a2.slot", "s1.slot"]
+
+    server.stop()
+    with open(server.log_path) as f:
+        log = f.read()
+    assert "2 slot saves pending, saving synchronously" in log
+    assert len(re.findall(r"saved to '.*a[12]\.slot': snapshot [0-9.]+ s, write [0-9.]+ s, [0-9.]+ MiB", log)) == 2
+
+    # the async file restores
+    server.log_path = None
+    server.start()
+    res = restore(0, "a1.slot")
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+    assert res.body["n_read"] == len(files["a1.slot"])
+    if not appendix:
+        assert prompt_n_germany(0) == 6
+
+
+def test_slow_save_does_not_block_other_slots(monkeypatch):
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_WRITE_DELAY_MS", "3000")
+    server.start()
+    fill_slot(0)
+    results = []
+    t_save = time.time()
+    t = save_in_thread(0, "k0.slot", results)
+    time.sleep(0.3)
+
+    # a completion on slot 1, and a restore into it, while the save of slot 0 is pending
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?",
+        "id_slot": 1,
+        "n_predict": 8,
+    })
+    assert res.status_code == 200
+    assert t.is_alive()
+    assert results == []
+    assert time.time() - t_save < 2.5
+    # the file appears only once it is complete
+    assert os.listdir(store_path(FP)) == []
+
+    t.join()
+    assert results[0][1] == 200
+    assert results[0][3] >= 3
+    assert results[0][2]["timings"]["save_ms"] >= 3000
+    assert os.listdir(store_path(FP)) == ["k0.slot"]
+    assert restore(1, "k0.slot").status_code == 200
+    assert prompt_n_germany(1) == 6
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_exit_waits_for_pending_save(monkeypatch, sig):
+    # SIGTERM drains, SIGINT ends the loop at once: either way the pending file is written before the exit
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_TEST_SLOT_WRITE_DELAY_MS", "2000")
+    server.start()
+    fill_slot(1)
+    results = []
+    t = save_in_thread(1, "k1.slot", results)
+    time.sleep(0.3)
+    assert server.process is not None
+    server.process.send_signal(sig)
+    assert wait_exit(10) == 0
+    t.join()
+    if sig == signal.SIGTERM:
+        # the save request is in flight, the drain waits for it
+        assert results[0][1] == 200
+    data = open(store_path(FP, "k1.slot"), "rb").read()
+    assert data[-TRAILER:-32] == b"B3SLOT01"
+    assert os.listdir(store_path(FP)) == ["k1.slot"]
+
+    server.start()
+    res = restore(0, "k1.slot")
+    assert res.status_code == 200
+    assert res.body["n_restored"] == 84
+    assert res.body["n_read"] == len(data)
+    assert prompt_n_germany(0) == 6

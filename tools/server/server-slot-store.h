@@ -28,6 +28,9 @@ static constexpr size_t SLOT_STORE_TRAILER_SIZE = 40;
 // append the trailer to tmp, fsync it, check that it holds n_bytes and the trailer, and rename it to path; on failure tmp is removed
 bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err);
 
+// write data to a temporary file next to path and commit it like slot_store_commit, with the hash of data
+bool slot_store_save(const std::string & path, const uint8_t * data, size_t size, std::string & err);
+
 // read the whole file with one open, at most max_bytes, verify the trailer and remove it from data
 bool slot_store_read(const std::string & path, int64_t max_bytes, std::vector<uint8_t> & data, std::string & err);
 

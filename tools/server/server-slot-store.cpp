@@ -63,8 +63,8 @@ static void blake3_of(const uint8_t * data, size_t size, uint8_t * out) {
     blake3_hasher_finalize(&hasher, out, BLAKE3_OUT_LEN);
 }
 
-// appends the trailer to the file at path
-static bool append_trailer(const std::string & path, std::string & err) {
+// the BLAKE3 hash of the file at path
+static bool hash_file(const std::string & path, uint8_t * digest, std::string & err) {
     FILE * f = ggml_fopen(path.c_str(), "rb");
     if (!f) {
         err = std::string("open: ") + strerror(errno);
@@ -85,16 +85,19 @@ static bool append_trailer(const std::string & path, std::string & err) {
         err = std::string("read: ") + strerror(errno_read ? errno_read : EIO);
         return false;
     }
-    uint8_t digest[BLAKE3_OUT_LEN];
-    blake3_hasher_finalize(&hasher, digest, sizeof(digest));
+    blake3_hasher_finalize(&hasher, digest, BLAKE3_OUT_LEN);
+    return true;
+}
 
-    f = ggml_fopen(path.c_str(), "ab");
+// appends the trailer with the given hash to the file at path
+static bool append_trailer(const std::string & path, const uint8_t * digest, std::string & err) {
+    FILE * f = ggml_fopen(path.c_str(), "ab");
     if (!f) {
         err = std::string("open: ") + strerror(errno);
         return false;
     }
     bool ok = fwrite(SLOT_TRAILER_MAGIC, 1, sizeof(SLOT_TRAILER_MAGIC), f) == sizeof(SLOT_TRAILER_MAGIC) &&
-              fwrite(digest, 1, sizeof(digest), f) == sizeof(digest);
+              fwrite(digest, 1, BLAKE3_OUT_LEN, f) == BLAKE3_OUT_LEN;
     int errno_write = errno;
     if (fclose(f) != 0 && ok) {
         ok = false;
@@ -197,7 +200,8 @@ static const std::string & slot_store_boot_id() {
     return id;
 }
 
-bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err) {
+// digest: the hash of the n_bytes that were written to tmp, nullptr to hash the file
+static bool slot_store_commit_impl(const std::string & tmp, const std::string & path, uint64_t n_bytes, const uint8_t * digest, std::string & err) {
     // test hook: "before" fails the rename, "after" renames and then reports an error
     static const std::string test_rename_error = [] {
         const char * val = getenv("LLAMA_SERVER_TEST_RENAME_ERROR");
@@ -220,7 +224,14 @@ bool slot_store_commit(const std::string & tmp, const std::string & path, uint64
 
     // the hash is in the one file that the rename publishes, so the two cannot get out of step
     std::string err_trailer;
-    if (!append_trailer(tmp, err_trailer)) {
+    uint8_t digest_file[BLAKE3_OUT_LEN];
+    if (digest == nullptr) {
+        if (!hash_file(tmp, digest_file, err_trailer)) {
+            return fail("trailer: " + err_trailer);
+        }
+        digest = digest_file;
+    }
+    if (!append_trailer(tmp, digest, err_trailer)) {
         return fail("trailer: " + err_trailer);
     }
     n_bytes += SLOT_STORE_TRAILER_SIZE;
@@ -272,6 +283,36 @@ bool slot_store_commit(const std::string & tmp, const std::string & path, uint64
         return true;
     }
     return fail("rename: " + ec.message());
+}
+
+bool slot_store_commit(const std::string & tmp, const std::string & path, uint64_t n_bytes, std::string & err) {
+    return slot_store_commit_impl(tmp, path, n_bytes, nullptr, err);
+}
+
+bool slot_store_save(const std::string & path, const uint8_t * data, size_t size, std::string & err) {
+    const std::string tmp = slot_store_tmp_path(path);
+    FILE * f = ggml_fopen(tmp.c_str(), "wb");
+    if (!f) {
+        err = std::string("open: ") + strerror(errno);
+        return false;
+    }
+    errno = 0;
+    bool ok = size == 0 || fwrite(data, 1, size, f) == size;
+    int errno_write = errno;
+    if (fclose(f) != 0 && ok) {
+        ok = false;
+        errno_write = errno;
+    }
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(fs::u8path(tmp), ec);
+        err = std::string("write: ") + strerror(errno_write ? errno_write : EIO);
+        return false;
+    }
+    // hash the bytes in memory, reading the file back over NFS would take as long as the write
+    uint8_t digest[BLAKE3_OUT_LEN];
+    blake3_of(data, size, digest);
+    return slot_store_commit_impl(tmp, path, size, digest, err);
 }
 
 static int64_t to_unix_seconds(fs::file_time_type t) {

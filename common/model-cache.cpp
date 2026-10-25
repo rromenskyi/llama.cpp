@@ -737,9 +737,10 @@ struct fetcher {
             return std::string(val ? val : "");
         }();
 
-        const std::string path_link = dir + "/." + sha + "." + token + "." + std::to_string((long long) time(nullptr)) + ".load";
         for (int round = 0; round < 3; round++) {
             run();
+            // the time in the name is when the link is made, run() may download or wait for long
+            const std::string path_link = dir + "/." + sha + "." + token + "." + std::to_string((long long) time(nullptr)) + ".load";
             unlink(path_link.c_str());
             int err = link(final_path.c_str(), path_link.c_str()) == 0 ? 0 : errno;
             if (round == 0 && !test_link_error.empty()) {

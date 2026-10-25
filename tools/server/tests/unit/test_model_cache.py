@@ -537,3 +537,15 @@ def test_link_error_fails(tmp_path, monkeypatch):
     server.log_path = str(tmp_path / "server.log")
     assert start_fails(server) != 0
     assert f"cannot link {final()} to " in open(server.log_path).read()
+
+
+def test_link_time_is_after_download(tmp_path):
+    # the time in the link name is taken when the link is made, not before a slow download
+    global server
+    files.on_get = lambda path: time.sleep(3)
+    server.log_path = str(tmp_path / "server.log")
+    t_start = time.time()
+    server.start()
+    m = re.search(r"loading the verified model from '\S*\.(\d+)\.load'", open(server.log_path).read())
+    assert m is not None
+    assert int(m.group(1)) >= int(t_start + 3)

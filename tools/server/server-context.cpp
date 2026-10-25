@@ -2703,16 +2703,34 @@ private:
         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
     }
 
-    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
-        ofs.write((const char *) src, size);
+    static void ckpt_write(std::ostream & os, const void * src, size_t size, size_t & n_written) {
+        os.write((const char *) src, size);
         n_written += size;
     }
 
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+    static void ckpt_write_buf(std::ostream & os, const std::vector<uint8_t> & buf, size_t & n_written) {
         const uint64_t n = buf.size();
-        ckpt_write(ofs, &n, sizeof(n), n_written);
+        ckpt_write(os, &n, sizeof(n), n_written);
         if (n > 0) {
-            ckpt_write(ofs, buf.data(), n, n_written);
+            ckpt_write(os, buf.data(), n, n_written);
+        }
+    }
+
+    // the context checkpoint appendix, to a file or to a snapshot in memory
+    static void write_slot_checkpoints(std::ostream & os, const server_slot & slot, size_t & n_written) {
+        const uint32_t magic   = SLOT_CKPT_MAGIC;
+        const uint32_t version = SLOT_CKPT_VERSION;
+        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
+        ckpt_write(os, &magic,   sizeof(magic),   n_written);
+        ckpt_write(os, &version, sizeof(version), n_written);
+        ckpt_write(os, &count,   sizeof(count),   n_written);
+        for (const auto & cur : slot.prompt.checkpoints) {
+            ckpt_write(os, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
+            ckpt_write(os, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
+            ckpt_write(os, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
+            ckpt_write_buf(os, cur.data_tgt,  n_written);
+            ckpt_write_buf(os, cur.data_dft,  n_written);
+            ckpt_write_buf(os, cur.data_spec, n_written);
         }
     }
 
@@ -2727,20 +2745,8 @@ private:
             SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
             return false;
         }
-        const uint32_t magic   = SLOT_CKPT_MAGIC;
-        const uint32_t version = SLOT_CKPT_VERSION;
-        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
-        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
-        ckpt_write(ofs, &version, sizeof(version), n_written);
-        ckpt_write(ofs, &count,   sizeof(count),   n_written);
-        for (const auto & cur : slot.prompt.checkpoints) {
-            ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
-            ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
-            ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
-            ckpt_write_buf(ofs, cur.data_dft,  n_written);
-            ckpt_write_buf(ofs, cur.data_spec, n_written);
-        }
+        const uint32_t count = (uint32_t) slot.prompt.checkpoints.size();
+        write_slot_checkpoints(ofs, slot, n_written);
         ofs.close();
         if (!ofs) {
             SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
@@ -2815,16 +2821,33 @@ private:
     static constexpr uint32_t SLOT_DRAFT_MAGIC   = 0x54464453; // "SDFT"
     static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
 
-    // returns false if the draft state could not be written completely
-    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
-        n_written = 0;
-        std::vector<uint8_t> data_dft;
-        std::vector<uint8_t> data_spec;
+    // the draft state of the slot, both empty if there is none
+    void get_slot_draft(const server_slot & slot, std::vector<uint8_t> & data_dft, std::vector<uint8_t> & data_spec) const {
+        data_dft.clear();
+        data_spec.clear();
         if (ctx_dft != nullptr) {
             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
             llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
         common_speculative_get_state(spec.get(), slot.id, data_spec);
+    }
+
+    // the draft state appendix, to a file or to a snapshot in memory
+    static void write_slot_draft(std::ostream & os, const std::vector<uint8_t> & data_dft, const std::vector<uint8_t> & data_spec, size_t & n_written) {
+        const uint32_t magic   = SLOT_DRAFT_MAGIC;
+        const uint32_t version = SLOT_DRAFT_VERSION;
+        ckpt_write(os, &magic,   sizeof(magic),   n_written);
+        ckpt_write(os, &version, sizeof(version), n_written);
+        ckpt_write_buf(os, data_dft,  n_written);
+        ckpt_write_buf(os, data_spec, n_written);
+    }
+
+    // returns false if the draft state could not be written completely
+    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+        n_written = 0;
+        std::vector<uint8_t> data_dft;
+        std::vector<uint8_t> data_spec;
+        get_slot_draft(slot, data_dft, data_spec);
         if (data_dft.empty() && data_spec.empty()) {
             return true;
         }
@@ -2833,12 +2856,7 @@ private:
             SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
             return false;
         }
-        const uint32_t magic   = SLOT_DRAFT_MAGIC;
-        const uint32_t version = SLOT_DRAFT_VERSION;
-        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
-        ckpt_write(ofs, &version, sizeof(version), n_written);
-        ckpt_write_buf(ofs, data_dft,  n_written);
-        ckpt_write_buf(ofs, data_spec, n_written);
+        write_slot_draft(ofs, data_dft, data_spec, n_written);
         ofs.close();
         if (!ofs) {
             SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());

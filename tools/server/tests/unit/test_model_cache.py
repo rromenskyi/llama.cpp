@@ -340,6 +340,10 @@ def test_ttl_eviction():
     write_file(os.path.join(cache, f"{young}.gguf.blake3"), b"b" * 64 + b"\n", age_s=6 * day)
     write_file(os.path.join(cache, f"{orphan}.gguf.blake3"), b"c" * 64 + b"\n")
     write_file(os.path.join(cache, f".{other}.pod-a.1.blake3.tmp"), age_s=2 * 3600)
+    # private links share the times of their model, their age is in the name
+    now = int(time.time())
+    write_file(os.path.join(cache, f".{other}.pod-a.1.ab.{now - 60}.load"), age_s=2 * 3600)
+    write_file(os.path.join(cache, f".{other}.pod-b.2.cd.{now - 7 * 3600}.load"))
     write_file(os.path.join(cache, "notes.gguf"), age_s=8 * day)
     write_file(os.path.join(cache, f".{other}.pod-a.1.tmp"), age_s=2 * 3600)
     write_file(os.path.join(cache, f".{young}.pod-a.1.tmp"), age_s=60)
@@ -352,6 +356,7 @@ def test_ttl_eviction():
     server.start()
     assert files.gets == {}
     assert listing() == sorted([
+        f".{other}.pod-a.1.ab.{now - 60}.load",
         f".{young}.lock",
         f".{young}.pod-a.1.tmp",
         f"{young}.gguf",
@@ -497,3 +502,38 @@ def test_unreadable_sidecar_left_alone(tmp_path):
     log = open(server.log_path).read()
     assert f"cannot read {sidecar()}: Permission denied, checking sha256" in log
     assert f"verified {final()} with sha256 in " in log
+
+
+def test_link_enoent_verifies_again(tmp_path, monkeypatch):
+    # the verified file is moved aside before it is linked: verify again, never load it by its name
+    global server
+    monkeypatch.setenv("LLAMA_MODEL_CACHE_TEST_LINK_ERROR", "ENOENT")
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    assert files.gets == {"/model": 1}
+    assert listing() == cached()
+    log = open(server.log_path).read()
+    assert f"{final()} is gone, verifying again" in log
+    assert f"verified {final()} with blake3 in " in log
+    assert "loading the verified model from" in log
+    assert "loading it by its name" not in log
+
+
+def test_link_unsupported_loads_by_name(tmp_path, monkeypatch):
+    global server
+    monkeypatch.setenv("LLAMA_MODEL_CACHE_TEST_LINK_ERROR", "EXDEV")
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    log = open(server.log_path).read()
+    assert "loading it by its name" in log
+    assert "loading the verified model from" not in log
+    res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
+    assert res.status_code == 200
+
+
+def test_link_error_fails(tmp_path, monkeypatch):
+    global server
+    monkeypatch.setenv("LLAMA_MODEL_CACHE_TEST_LINK_ERROR", "EIO")
+    server.log_path = str(tmp_path / "server.log")
+    assert start_fails(server) != 0
+    assert f"cannot link {final()} to " in open(server.log_path).read()

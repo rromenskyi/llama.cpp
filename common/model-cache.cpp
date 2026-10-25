@@ -55,6 +55,7 @@ static constexpr int64_t LOW_SPEED_BYTES   = 100 * 1024; // per second
 static constexpr int     MAX_ATTEMPTS      = 3;
 static constexpr int     HASH_ATTEMPTS     = 3;
 static constexpr int64_t LEFTOVER_MAX_AGE  = 3600;
+static constexpr int64_t LOAD_MAX_AGE      = 6 * 3600;
 static constexpr int     TOUCH_SECONDS     = 24 * 3600;
 
 static bool is_hex64(const std::string & s, size_t pos) {
@@ -94,6 +95,28 @@ static std::string to_hex(const blake3_hasher & ctx) {
 // <dir>/<sha256>.gguf.blake3: the blake3 of a file that hashed right with sha256, checked instead of the slower sha256
 static std::string sidecar_path(const std::string & final_path) {
     return final_path + ".blake3";
+}
+
+// the creation time in the name of a private link .<sha>.<token>.<time>.load, or -1
+static int64_t load_link_time(const std::string & name) {
+    if (name.size() < 7 || name.compare(name.size() - 5, 5, ".load") != 0) {
+        return -1;
+    }
+    const size_t end = name.size() - 5;
+    const size_t begin = name.rfind('.', end - 1) + 1;
+    if (begin == 0 || begin == end || name.find_first_not_of("0123456789", begin) != end) {
+        return -1;
+    }
+    return std::stoll(name.substr(begin, end - begin));
+}
+
+// errors of link() that mean the file system has no hard links
+static bool link_unsupported(int err) {
+    return err == EPERM || err == EXDEV || err == EMLINK || err == ENOTSUP
+#if EOPNOTSUPP != ENOTSUP
+        || err == EOPNOTSUPP
+#endif
+        ;
 }
 
 static double seconds_since(std::chrono::steady_clock::time_point t) {
@@ -187,8 +210,10 @@ static void evict(const std::string & dir, const std::set<std::string> & keep, i
             const std::string name = e.path().filename().string();
             const std::string path = e.path().string();
             if (name.size() > 66 && name[0] == '.' && is_hex64(name, 1) && name[65] == '.') {
-                // a temporary or moved-aside file, or a lock whose heartbeat stopped
-                if (now - newest_mtime(path) > LEFTOVER_MAX_AGE) {
+                // a temporary or moved-aside file, a lock whose heartbeat stopped, or a private link of a server that
+                // died while loading; a link shares the times of the model, so its age is in its name
+                const int64_t t_link = load_link_time(name);
+                if (t_link >= 0 ? now - t_link > LOAD_MAX_AGE : now - newest_mtime(path) > LEFTOVER_MAX_AGE) {
                     LOG_INF("model cache: removing leftover %s\n", path.c_str());
                     fs::remove_all(path, ec);
                     if (ec) {
@@ -706,13 +731,32 @@ struct fetcher {
     // runs, then links the final file to a name private to this process, so that the file loaded is the one verified
     // even if the final file is replaced meanwhile; returns the link, or an empty string when no link can be made
     std::string get() {
-        const std::string path_link = dir + "/." + sha + "." + token + ".load";
+        // test hook: the first link fails with this error
+        static const std::string test_link_error = [] {
+            const char * val = getenv("LLAMA_MODEL_CACHE_TEST_LINK_ERROR");
+            return std::string(val ? val : "");
+        }();
+
+        const std::string path_link = dir + "/." + sha + "." + token + "." + std::to_string((long long) time(nullptr)) + ".load";
         for (int round = 0; round < 3; round++) {
             run();
             unlink(path_link.c_str());
-            if (link(final_path.c_str(), path_link.c_str()) != 0) {
-                LOG_WRN("model cache: cannot link %s to %s: %s, loading it by its name\n", final_path.c_str(), path_link.c_str(), strerror(errno));
+            int err = link(final_path.c_str(), path_link.c_str()) == 0 ? 0 : errno;
+            if (round == 0 && !test_link_error.empty()) {
+                unlink(path_link.c_str());
+                err = test_link_error == "ENOENT" ? ENOENT : test_link_error == "EXDEV" ? EXDEV : EIO;
+            }
+            if (err == ENOENT) {
+                // moved aside by another server since it was verified
+                LOG_WRN("model cache: %s is gone, verifying again\n", final_path.c_str());
+                continue;
+            }
+            if (link_unsupported(err)) {
+                LOG_WRN("model cache: cannot link %s to %s: %s, loading it by its name\n", final_path.c_str(), path_link.c_str(), strerror(err));
                 return "";
+            }
+            if (err != 0) {
+                throw std::runtime_error("cannot link " + final_path + " to " + path_link + ": " + strerror(err));
             }
             struct stat st;
             if (stat(path_link.c_str(), &st) == 0 && st.st_dev == st_good.st_dev && st.st_ino == st_good.st_ino) {

@@ -743,7 +743,8 @@ def test_slot_file_keeps_newest_checkpoints(swa_server):
         "n_predict": 4,
     })
     assert res.status_code == 200
-    assert res.body["timings"]["cache_n"] >= n_prompt - 4 - 32
+    # the generated tokens differ, so the cache rolls back to the newest restored checkpoint
+    assert res.body["timings"]["cache_n"] == saved[-1] - 1
 
 
 # an agent conversation (tool calls, then a new user message) continues from a restored slot file

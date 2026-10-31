@@ -2898,21 +2898,38 @@ private:
         }
     }
 
+    // a slot file keeps at most this many checkpoints: each one is a full copy of the recurrent/SWA state,
+    // and the slot holds up to --ctx-checkpoints of them, so the file would grow with every turn
+    static constexpr size_t SLOT_CKPT_SAVE_MAX = 3;
+
+    // the newest checkpoints, oldest first: they continue the conversation
+    static std::vector<const common_prompt_checkpoint *> slot_checkpoints_to_save(const server_slot & slot) {
+        std::vector<const common_prompt_checkpoint *> saved;
+        for (const auto & cur : slot.prompt.checkpoints) {
+            saved.push_back(&cur);
+        }
+        if (saved.size() > SLOT_CKPT_SAVE_MAX) {
+            saved.erase(saved.begin(), saved.end() - SLOT_CKPT_SAVE_MAX);
+        }
+        return saved;
+    }
+
     // the context checkpoint appendix, to a file or to a snapshot in memory
     static void write_slot_checkpoints(std::ostream & os, const server_slot & slot, size_t & n_written) {
+        const auto saved = slot_checkpoints_to_save(slot);
         const uint32_t magic   = SLOT_CKPT_MAGIC;
         const uint32_t version = SLOT_CKPT_VERSION;
-        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
+        const uint32_t count   = (uint32_t) saved.size();
         ckpt_write(os, &magic,   sizeof(magic),   n_written);
         ckpt_write(os, &version, sizeof(version), n_written);
         ckpt_write(os, &count,   sizeof(count),   n_written);
-        for (const auto & cur : slot.prompt.checkpoints) {
-            ckpt_write(os, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
-            ckpt_write(os, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
-            ckpt_write(os, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(os, cur.data_tgt,  n_written);
-            ckpt_write_buf(os, cur.data_dft,  n_written);
-            ckpt_write_buf(os, cur.data_spec, n_written);
+        for (const auto * cur : saved) {
+            ckpt_write(os, &cur->n_tokens, sizeof(cur->n_tokens), n_written);
+            ckpt_write(os, &cur->pos_min,  sizeof(cur->pos_min),  n_written);
+            ckpt_write(os, &cur->pos_max,  sizeof(cur->pos_max),  n_written);
+            ckpt_write_buf(os, cur->data_tgt,  n_written);
+            ckpt_write_buf(os, cur->data_dft,  n_written);
+            ckpt_write_buf(os, cur->data_spec, n_written);
         }
     }
 
@@ -2927,7 +2944,7 @@ private:
             SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
             return false;
         }
-        const uint32_t count = (uint32_t) slot.prompt.checkpoints.size();
+        const uint32_t count = (uint32_t) slot_checkpoints_to_save(slot).size();
         write_slot_checkpoints(ofs, slot, n_written);
         ofs.close();
         if (!ofs) {

@@ -697,6 +697,106 @@ def parse_ckpt_appendix(data):
     return off, ckpts
 
 
+def saved_ckpt_n_tokens(server, filename):
+    with open(os.path.join(server.slot_save_path, filename), "rb") as f:
+        data = f.read()
+    _, ckpts = parse_ckpt_appendix(data)
+    return [struct.unpack_from("<q", data, start)[0] for start, _, _ in ckpts]
+
+
+# a slot file keeps the newest checkpoints only: the slot holds one or two more after every turn
+def test_slot_file_keeps_newest_checkpoints(swa_server):
+    server = swa_server
+    server.start()
+
+    prompt = "The quick brown fox jumps over the lazy dog. " * 10
+    for i in range(3):
+        prompt += f"Part {i} of the story goes on for a while. " * 5
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "id_slot": 1,
+            "cache_prompt": True,
+            "n_predict": 4,
+        })
+        assert res.status_code == 200
+    n_prompt = res.body["timings"]["cache_n"] + res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "ckpt_newest.bin",
+    })
+    assert res.status_code == 200
+    saved = saved_ckpt_n_tokens(server, "ckpt_newest.bin")
+    assert len(saved) == 3
+    # the last two are those of the last prompt, made 4 + n_ubatch and 4 tokens before its end
+    assert saved[1:] == [n_prompt - 4 - 32, n_prompt - 4]
+    assert saved[0] < saved[1]
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "ckpt_newest.bin",
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt + "A new part.",
+        "id_slot": 1,
+        "cache_prompt": True,
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= n_prompt - 4 - 32
+
+
+# an agent conversation (tool calls, then a new user message) continues from a restored slot file
+# that holds only the newest checkpoints
+def test_slot_file_newest_checkpoints_continue_tool_loop(swa_server):
+    server = swa_server
+    server.chat_template_file = "../../../models/templates/Qwen3.5-4B.jinja"
+    server.start()
+
+    system = {"role": "system", "content": "You are a helpful assistant."}
+    user = {"role": "user", "content": "Tell me a long story about a quick brown fox and a lazy dog. " * 8}
+    tool_turns = [
+        [
+            {"role": "assistant", "content": f"Step {i}.", "reasoning_content": f"I think about step {i} for a while. " * 4},
+            {"role": "tool", "content": f"Result {i}: the fox ran far away from the dog. " * 4},
+        ]
+        for i in range(2)
+    ]
+
+    messages = [system, user]
+    for turn in [[]] + tool_turns:
+        messages += turn
+        res = server.make_request("POST", "/chat/completions", data={
+            "messages": messages,
+            "id_slot": 1,
+            "cache_prompt": True,
+            "max_tokens": 4,
+        })
+        assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "ckpt_user.bin",
+    })
+    assert res.status_code == 200
+    saved = saved_ckpt_n_tokens(server, "ckpt_user.bin")
+    assert len(saved) == 3
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "ckpt_user.bin",
+    })
+    assert res.status_code == 200
+
+    # a new user message after the tool calls
+    res = server.make_request("POST", "/chat/completions", data={
+        "messages": messages + [{"role": "user", "content": "And then?"}],
+        "id_slot": 1,
+        "cache_prompt": True,
+        "max_tokens": 4,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0
+
+
 # a damaged appendix must be ignored, or its checkpoints dropped when they fail to load, without aborting the server
 @pytest.mark.parametrize("damage", ["oversized_blob", "empty_target", "corrupt_state", "many_checkpoints"])
 def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):
